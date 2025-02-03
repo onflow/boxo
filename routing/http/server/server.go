@@ -9,22 +9,28 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/gorilla/mux"
 	"github.com/ipfs/boxo/ipns"
+	"github.com/ipfs/boxo/routing/http/filters"
 	"github.com/ipfs/boxo/routing/http/internal/drjson"
 	"github.com/ipfs/boxo/routing/http/types"
 	"github.com/ipfs/boxo/routing/http/types/iter"
 	jsontypes "github.com/ipfs/boxo/routing/http/types/json"
 	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
-
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/routing"
+	"github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multibase"
+	"github.com/prometheus/client_golang/prometheus"
+	metrics "github.com/slok/go-http-metrics/metrics/prometheus"
+	"github.com/slok/go-http-metrics/middleware"
+	middlewarestd "github.com/slok/go-http-metrics/middleware/std"
 )
 
 const (
@@ -35,6 +41,7 @@ const (
 
 	DefaultRecordsLimit          = 20
 	DefaultStreamingRecordsLimit = 0
+	DefaultRoutingTimeout        = 30 * time.Second
 )
 
 var logger = logging.Logger("routing/http/server")
@@ -120,31 +127,75 @@ func WithStreamingRecordsLimit(limit int) Option {
 	}
 }
 
+func WithPrometheusRegistry(reg prometheus.Registerer) Option {
+	return func(s *server) {
+		s.promRegistry = reg
+	}
+}
+
+func WithRoutingTimeout(timeout time.Duration) Option {
+	return func(s *server) {
+		s.routingTimeout = timeout
+	}
+}
+
 func Handler(svc ContentRouter, opts ...Option) http.Handler {
 	server := &server{
 		svc:                   svc,
 		recordsLimit:          DefaultRecordsLimit,
 		streamingRecordsLimit: DefaultStreamingRecordsLimit,
+		routingTimeout:        DefaultRoutingTimeout,
 	}
 
 	for _, opt := range opts {
 		opt(server)
 	}
 
+	if server.promRegistry == nil {
+		server.promRegistry = prometheus.DefaultRegisterer
+	}
+
+	// Workaround due to https://github.com/slok/go-http-metrics
+	// using egistry.MustRegister internally.
+	// In production there will be only one handler, however we append counter
+	// to ensure duplicate metric registration will not panic in parallel tests
+	// when global prometheus.DefaultRegisterer is used.
+	metricsPrefix := "delegated_routing_server"
+	c := handlerCount.Add(1)
+	if c > 1 {
+		metricsPrefix = fmt.Sprintf("%s_%d", metricsPrefix, c)
+	}
+
+	// Create middleware with prometheus recorder
+	mdlw := middleware.New(middleware.Config{
+		Recorder: metrics.NewRecorder(metrics.Config{
+			Registry:        server.promRegistry,
+			Prefix:          metricsPrefix,
+			SizeBuckets:     prometheus.ExponentialBuckets(100, 4, 8), // [100 400 1600 6400 25600 102400 409600 1.6384e+06]
+			DurationBuckets: []float64{0.1, 0.5, 1, 2, 5, 8, 10, 20, 30},
+		}),
+	})
+
 	r := mux.NewRouter()
-	r.HandleFunc(findProvidersPath, server.findProviders).Methods(http.MethodGet)
-	r.HandleFunc(providePath, server.provide).Methods(http.MethodPut)
-	r.HandleFunc(findPeersPath, server.findPeers).Methods(http.MethodGet)
-	r.HandleFunc(GetIPNSPath, server.GetIPNS).Methods(http.MethodGet)
-	r.HandleFunc(GetIPNSPath, server.PutIPNS).Methods(http.MethodPut)
+	// Wrap each handler with the metrics middleware
+	r.Handle(findProvidersPath, middlewarestd.Handler(findProvidersPath, mdlw, http.HandlerFunc(server.findProviders))).Methods(http.MethodGet)
+	r.Handle(providePath, middlewarestd.Handler(providePath, mdlw, http.HandlerFunc(server.provide))).Methods(http.MethodPut)
+	r.Handle(findPeersPath, middlewarestd.Handler(findPeersPath, mdlw, http.HandlerFunc(server.findPeers))).Methods(http.MethodGet)
+	r.Handle(GetIPNSPath, middlewarestd.Handler(GetIPNSPath, mdlw, http.HandlerFunc(server.GetIPNS))).Methods(http.MethodGet)
+	r.Handle(GetIPNSPath, middlewarestd.Handler(GetIPNSPath, mdlw, http.HandlerFunc(server.PutIPNS))).Methods(http.MethodPut)
+
 	return r
 }
+
+var handlerCount atomic.Int32
 
 type server struct {
 	svc                   ContentRouter
 	disableNDJSON         bool
 	recordsLimit          int
 	streamingRecordsLimit int
+	promRegistry          prometheus.Registerer
+	routingTimeout        time.Duration
 }
 
 func (s *server) detectResponseType(r *http.Request) (string, error) {
@@ -193,6 +244,11 @@ func (s *server) findProviders(w http.ResponseWriter, httpReq *http.Request) {
 		return
 	}
 
+	// Parse query parameters
+	query := httpReq.URL.Query()
+	filterAddrs := filters.ParseFilter(query.Get("filter-addrs"))
+	filterProtocols := filters.ParseFilter(query.Get("filter-protocols"))
+
 	mediaType, err := s.detectResponseType(httpReq)
 	if err != nil {
 		writeErr(w, "FindProviders", http.StatusBadRequest, err)
@@ -200,7 +256,7 @@ func (s *server) findProviders(w http.ResponseWriter, httpReq *http.Request) {
 	}
 
 	var (
-		handlerFunc  func(w http.ResponseWriter, provIter iter.ResultIter[types.Record])
+		handlerFunc  func(w http.ResponseWriter, provIter iter.ResultIter[types.Record], filterAddrs, filterProtocols []string)
 		recordsLimit int
 	)
 
@@ -212,19 +268,28 @@ func (s *server) findProviders(w http.ResponseWriter, httpReq *http.Request) {
 		recordsLimit = s.recordsLimit
 	}
 
-	provIter, err := s.svc.FindProviders(httpReq.Context(), cid, recordsLimit)
+	ctx, cancel := context.WithTimeout(httpReq.Context(), s.routingTimeout)
+	defer cancel()
+
+	provIter, err := s.svc.FindProviders(ctx, cid, recordsLimit)
 	if err != nil {
-		writeErr(w, "FindProviders", http.StatusInternalServerError, fmt.Errorf("delegate error: %w", err))
-		return
+		if errors.Is(err, routing.ErrNotFound) {
+			// handlerFunc takes care of setting the 404 and necessary headers
+			provIter = iter.FromSlice([]iter.Result[types.Record]{})
+		} else {
+			writeErr(w, "FindProviders", http.StatusInternalServerError, fmt.Errorf("delegate error: %w", err))
+			return
+		}
 	}
 
-	handlerFunc(w, provIter)
+	handlerFunc(w, provIter, filterAddrs, filterProtocols)
 }
 
-func (s *server) findProvidersJSON(w http.ResponseWriter, provIter iter.ResultIter[types.Record]) {
+func (s *server) findProvidersJSON(w http.ResponseWriter, provIter iter.ResultIter[types.Record], filterAddrs, filterProtocols []string) {
 	defer provIter.Close()
 
-	providers, err := iter.ReadAllResults(provIter)
+	filteredIter := filters.ApplyFiltersToIter(provIter, filterAddrs, filterProtocols)
+	providers, err := iter.ReadAllResults(filteredIter)
 	if err != nil {
 		writeErr(w, "FindProviders", http.StatusInternalServerError, fmt.Errorf("delegate error: %w", err))
 		return
@@ -235,30 +300,46 @@ func (s *server) findProvidersJSON(w http.ResponseWriter, provIter iter.ResultIt
 	})
 }
 
-func (s *server) findProvidersNDJSON(w http.ResponseWriter, provIter iter.ResultIter[types.Record]) {
-	writeResultsIterNDJSON(w, provIter)
+func (s *server) findProvidersNDJSON(w http.ResponseWriter, provIter iter.ResultIter[types.Record], filterAddrs, filterProtocols []string) {
+	filteredIter := filters.ApplyFiltersToIter(provIter, filterAddrs, filterProtocols)
+
+	writeResultsIterNDJSON(w, filteredIter)
 }
 
 func (s *server) findPeers(w http.ResponseWriter, r *http.Request) {
 	pidStr := mux.Vars(r)["peer-id"]
 
-	// pidStr must be in CIDv1 format. Therefore, use [cid.Decode]. We can't use
-	// [peer.Decode] because that would allow other formats to pass through.
-	cid, err := cid.Decode(pidStr)
+	// While specification states that peer-id is expected to be in CIDv1 format, reality
+	// is the clients will often learn legacy PeerID string from other sources,
+	// and try to use it.
+	// See https://github.com/libp2p/specs/blob/master/peer-ids/peer-ids.md#string-representation
+	// We are liberal in inputs here, and uplift legacy PeerID to CID if necessary.
+	// Rationale: it is better to fix this common mistake than to error and break peer routing.
+
+	// Attempt to parse PeerID
+	pid, err := peer.Decode(pidStr)
 	if err != nil {
-		if pid, err := peer.Decode(pidStr); err == nil {
-			writeErr(w, "FindPeers", http.StatusBadRequest, fmt.Errorf("the value is a peer ID, try using its CID representation: %s", peer.ToCid(pid).String()))
-		} else {
-			writeErr(w, "FindPeers", http.StatusBadRequest, fmt.Errorf("unable to parse peer ID: %w", err))
+		// Retry by parsing PeerID as CID, then setting codec to libp2p-key
+		// and turning that back to PeerID.
+		// This is necessary to make sure legacy keys like:
+		// - RSA QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N
+		// - ED25519 12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA
+		// are parsed correctly.
+		pidAsCid, err2 := cid.Decode(pidStr)
+		if err2 == nil {
+			pidAsCid = cid.NewCidV1(cid.Libp2pKey, pidAsCid.Hash())
+			pid, err = peer.FromCid(pidAsCid)
 		}
+	}
+
+	if err != nil {
+		writeErr(w, "FindPeers", http.StatusBadRequest, fmt.Errorf("unable to parse PeerID %q: %w", pidStr, err))
 		return
 	}
 
-	pid, err := peer.FromCid(cid)
-	if err != nil {
-		writeErr(w, "FindPeers", http.StatusBadRequest, fmt.Errorf("unable to parse peer ID: %w", err))
-		return
-	}
+	query := r.URL.Query()
+	filterAddrs := filters.ParseFilter(query.Get("filter-addrs"))
+	filterProtocols := filters.ParseFilter(query.Get("filter-protocols"))
 
 	mediaType, err := s.detectResponseType(r)
 	if err != nil {
@@ -267,7 +348,7 @@ func (s *server) findPeers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		handlerFunc  func(w http.ResponseWriter, provIter iter.ResultIter[*types.PeerRecord])
+		handlerFunc  func(w http.ResponseWriter, provIter iter.ResultIter[*types.PeerRecord], filterAddrs, filterProtocols []string)
 		recordsLimit int
 	)
 
@@ -279,16 +360,26 @@ func (s *server) findPeers(w http.ResponseWriter, r *http.Request) {
 		recordsLimit = s.recordsLimit
 	}
 
-	provIter, err := s.svc.FindPeers(r.Context(), pid, recordsLimit)
+	// Add timeout to the routing operation
+	ctx, cancel := context.WithTimeout(r.Context(), s.routingTimeout)
+	defer cancel()
+
+	provIter, err := s.svc.FindPeers(ctx, pid, recordsLimit)
 	if err != nil {
-		writeErr(w, "FindPeers", http.StatusInternalServerError, fmt.Errorf("delegate error: %w", err))
-		return
+		if errors.Is(err, routing.ErrNotFound) {
+			// handlerFunc takes care of setting the 404 and necessary headers
+			provIter = iter.FromSlice([]iter.Result[*types.PeerRecord]{})
+		} else {
+			writeErr(w, "FindPeers", http.StatusInternalServerError, fmt.Errorf("delegate error: %w", err))
+			return
+		}
 	}
 
-	handlerFunc(w, provIter)
+	handlerFunc(w, provIter, filterAddrs, filterProtocols)
 }
 
 func (s *server) provide(w http.ResponseWriter, httpReq *http.Request) {
+	//nolint:staticcheck
 	//lint:ignore SA1019 // ignore staticcheck
 	req := jsontypes.WriteProvidersRequest{}
 	err := json.NewDecoder(httpReq.Body).Decode(&req)
@@ -298,11 +389,13 @@ func (s *server) provide(w http.ResponseWriter, httpReq *http.Request) {
 		return
 	}
 
+	//nolint:staticcheck
 	//lint:ignore SA1019 // ignore staticcheck
 	resp := jsontypes.WriteProvidersResponse{}
 
 	for i, prov := range req.Providers {
 		switch v := prov.(type) {
+		//nolint:staticcheck
 		//lint:ignore SA1019 // ignore staticcheck
 		case *types.WriteBitswapRecord:
 			err := v.Verify()
@@ -347,8 +440,10 @@ func (s *server) provide(w http.ResponseWriter, httpReq *http.Request) {
 	writeJSONResult(w, "Provide", resp)
 }
 
-func (s *server) findPeersJSON(w http.ResponseWriter, peersIter iter.ResultIter[*types.PeerRecord]) {
+func (s *server) findPeersJSON(w http.ResponseWriter, peersIter iter.ResultIter[*types.PeerRecord], filterAddrs, filterProtocols []string) {
 	defer peersIter.Close()
+
+	peersIter = filters.ApplyFiltersToPeerRecordIter(peersIter, filterAddrs, filterProtocols)
 
 	peers, err := iter.ReadAllResults(peersIter)
 	if err != nil {
@@ -361,13 +456,30 @@ func (s *server) findPeersJSON(w http.ResponseWriter, peersIter iter.ResultIter[
 	})
 }
 
-func (s *server) findPeersNDJSON(w http.ResponseWriter, peersIter iter.ResultIter[*types.PeerRecord]) {
-	writeResultsIterNDJSON(w, peersIter)
+func (s *server) findPeersNDJSON(w http.ResponseWriter, peersIter iter.ResultIter[*types.PeerRecord], filterAddrs, filterProtocols []string) {
+	// Convert PeerRecord to Record so that we can reuse the filtering logic from findProviders
+	mappedIter := iter.Map(peersIter, func(v iter.Result[*types.PeerRecord]) iter.Result[types.Record] {
+		if v.Err != nil || v.Val == nil {
+			return iter.Result[types.Record]{Err: v.Err}
+		}
+
+		var record types.Record = v.Val
+		return iter.Result[types.Record]{Val: record}
+	})
+
+	filteredIter := filters.ApplyFiltersToIter(mappedIter, filterAddrs, filterProtocols)
+	writeResultsIterNDJSON(w, filteredIter)
 }
 
 func (s *server) GetIPNS(w http.ResponseWriter, r *http.Request) {
-	if !strings.Contains(r.Header.Get("Accept"), mediaTypeIPNSRecord) {
-		writeErr(w, "GetIPNS", http.StatusNotAcceptable, errors.New("content type in 'Accept' header is missing or not supported"))
+	acceptHdrValue := r.Header.Get("Accept")
+	// When 'Accept' header is missing, default to 'application/vnd.ipfs.ipns-record'
+	// (improved UX, similar to how we default to JSON response for /providers and /peers)
+	if len(acceptHdrValue) == 0 || strings.Contains(acceptHdrValue, mediaTypeWildcard) {
+		acceptHdrValue = mediaTypeIPNSRecord
+	}
+	if !strings.Contains(acceptHdrValue, mediaTypeIPNSRecord) {
+		writeErr(w, "GetIPNS", http.StatusNotAcceptable, errors.New("content type in 'Accept' header is not supported, retry with 'application/vnd.ipfs.ipns-record'"))
 		return
 	}
 
@@ -385,10 +497,18 @@ func (s *server) GetIPNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	record, err := s.svc.GetIPNS(r.Context(), name)
+	ctx, cancel := context.WithTimeout(r.Context(), s.routingTimeout)
+	defer cancel()
+
+	record, err := s.svc.GetIPNS(ctx, name)
 	if err != nil {
-		writeErr(w, "GetIPNS", http.StatusInternalServerError, fmt.Errorf("delegate error: %w", err))
-		return
+		if errors.Is(err, routing.ErrNotFound) {
+			writeErr(w, "GetIPNS", http.StatusNotFound, fmt.Errorf("delegate error: %w", err))
+			return
+		} else {
+			writeErr(w, "GetIPNS", http.StatusInternalServerError, fmt.Errorf("delegate error: %w", err))
+			return
+		}
 	}
 
 	rawRecord, err := ipns.MarshalRecord(record)
@@ -397,15 +517,31 @@ func (s *server) GetIPNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ttl, err := record.TTL(); err == nil {
-		w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%d", int(ttl.Seconds())))
+	var remainingValidity int
+	// Include 'Expires' header with time when signature expiration happens
+	if validityType, err := record.ValidityType(); err == nil && validityType == ipns.ValidityEOL {
+		if validity, err := record.Validity(); err == nil {
+			w.Header().Set("Expires", validity.UTC().Format(http.TimeFormat))
+			remainingValidity = int(time.Until(validity).Seconds())
+		}
 	} else {
-		w.Header().Set("Cache-Control", "max-age=60")
+		remainingValidity = int(ipns.DefaultRecordLifetime.Seconds())
 	}
+	if ttl, err := record.TTL(); err == nil {
+		setCacheControl(w, int(ttl.Seconds()), remainingValidity)
+	} else {
+		setCacheControl(w, int(ipns.DefaultRecordTTL.Seconds()), remainingValidity)
+	}
+	w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
 
-	recordEtag := strconv.FormatUint(xxhash.Sum64(rawRecord), 32)
-	w.Header().Set("Etag", recordEtag)
+	w.Header().Set("Etag", fmt.Sprintf(`"%x"`, xxhash.Sum64(rawRecord)))
 	w.Header().Set("Content-Type", mediaTypeIPNSRecord)
+
+	// Content-Disposition is not required, but improves UX by assigning a meaningful filename when opening URL in a web browser
+	if filename, err := cid.StringOfBase(multibase.Base36); err == nil {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.ipns-record\"", filename))
+	}
+	w.Header().Add("Vary", "Accept")
 	w.Write(rawRecord)
 }
 
@@ -448,7 +584,10 @@ func (s *server) PutIPNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.svc.PutIPNS(r.Context(), name, record)
+	ctx, cancel := context.WithTimeout(r.Context(), s.routingTimeout)
+	defer cancel()
+
+	err = s.svc.PutIPNS(ctx, name, record)
 	if err != nil {
 		writeErr(w, "PutIPNS", http.StatusInternalServerError, fmt.Errorf("delegate error: %w", err))
 		return
@@ -457,8 +596,30 @@ func (s *server) PutIPNS(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func writeJSONResult(w http.ResponseWriter, method string, val any) {
+var (
+	// Rule-of-thumb Cache-Control policy is to work well with caching proxies and load balancers.
+	// If there are any results, cache on the client for longer, and hint any in-between caches to
+	// serve cached result and upddate cache in background as long we have
+	// result that is within Amino DHT expiration window
+	maxAgeWithResults    = int((5 * time.Minute).Seconds())  // cache >0 results for longer
+	maxAgeWithoutResults = int((15 * time.Second).Seconds()) // cache no results briefly
+	maxStale             = int((48 * time.Hour).Seconds())   // allow stale results as long within Amino DHT  Expiration window
+)
+
+func setCacheControl(w http.ResponseWriter, maxAge int, stale int) {
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d, stale-if-error=%d", maxAge, stale, stale))
+}
+
+func writeJSONResult(w http.ResponseWriter, method string, val interface{ Length() int }) {
 	w.Header().Add("Content-Type", mediaTypeJSON)
+	w.Header().Add("Vary", "Accept")
+
+	if val.Length() > 0 {
+		setCacheControl(w, maxAgeWithResults, maxStale)
+	} else {
+		setCacheControl(w, maxAgeWithoutResults, maxStale)
+	}
+	w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
 
 	// keep the marshaling separate from the writing, so we can distinguish bugs (which surface as 500)
 	// from transient network issues (which surface as transport errors)
@@ -468,6 +629,12 @@ func writeJSONResult(w http.ResponseWriter, method string, val any) {
 		return
 	}
 
+	if val.Length() > 0 {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+	}
+
 	_, err = io.Copy(w, bytes.NewBuffer(b))
 	if err != nil {
 		logErr("Provide", "writing response body", err)
@@ -475,6 +642,10 @@ func writeJSONResult(w http.ResponseWriter, method string, val any) {
 }
 
 func writeErr(w http.ResponseWriter, method string, statusCode int, cause error) {
+	if errors.Is(cause, routing.ErrNotFound) {
+		setCacheControl(w, maxAgeWithoutResults, maxStale)
+	}
+
 	w.WriteHeader(statusCode)
 	causeStr := cause.Error()
 	if len(causeStr) > 1024 {
@@ -491,23 +662,32 @@ func logErr(method, msg string, err error) {
 	logger.Infow(msg, "Method", method, "Error", err)
 }
 
-func writeResultsIterNDJSON[T any](w http.ResponseWriter, resultIter iter.ResultIter[T]) {
+func writeResultsIterNDJSON[T types.Record](w http.ResponseWriter, resultIter iter.ResultIter[T]) {
 	defer resultIter.Close()
 
 	w.Header().Set("Content-Type", mediaTypeNDJSON)
-	w.WriteHeader(http.StatusOK)
+	w.Header().Add("Vary", "Accept")
+	w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
 
+	hasResults := false
 	for resultIter.Next() {
 		res := resultIter.Val()
 		if res.Err != nil {
 			logger.Errorw("ndjson iterator error", "Error", res.Err)
 			return
 		}
+
 		// don't use an encoder because we can't easily differentiate writer errors from encoding errors
 		b, err := drjson.MarshalJSONBytes(res.Val)
 		if err != nil {
 			logger.Errorw("ndjson marshal error", "Error", err)
 			return
+		}
+
+		if !hasResults {
+			hasResults = true
+			// There's results, cache useful result for longer
+			setCacheControl(w, maxAgeWithResults, maxStale)
 		}
 
 		_, err = w.Write(b)
@@ -525,5 +705,11 @@ func writeResultsIterNDJSON[T any](w http.ResponseWriter, resultIter iter.Result
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
+	}
+
+	if !hasResults {
+		// There weren't results, cache for shorter and send 404
+		setCacheControl(w, maxAgeWithoutResults, maxStale)
+		w.WriteHeader(http.StatusNotFound)
 	}
 }

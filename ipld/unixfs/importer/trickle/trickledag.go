@@ -19,11 +19,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-
-	ft "github.com/ipfs/boxo/ipld/unixfs"
-	h "github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
+	"time"
 
 	dag "github.com/ipfs/boxo/ipld/merkledag"
+	ft "github.com/ipfs/boxo/ipld/unixfs"
+	h "github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
 )
@@ -43,6 +43,13 @@ func Layout(db *h.DagBuilderHelper) (ipld.Node, error) {
 		return nil, err
 	}
 
+	if db.HasFileAttributes() {
+		err = db.SetFileAttributes(root)
+	}
+
+	if err != nil {
+		return nil, err
+	}
 	return root, db.Add(root)
 }
 
@@ -94,7 +101,6 @@ func Append(ctx context.Context, basen ipld.Node, db *h.DagBuilderHelper) (out i
 	}
 
 	// Convert to unixfs node for working with easily
-
 	fsn, err := h.NewFSNFromDag(base)
 	if err != nil {
 		return nil, err
@@ -109,9 +115,10 @@ func Append(ctx context.Context, basen ipld.Node, db *h.DagBuilderHelper) (out i
 		}
 
 		if db.Done() {
-			// TODO: If `FillNodeLayer` stop `Commit`ing this should be
-			// the place (besides the function end) to call it.
-			return fsn.GetDagNode()
+			if !fsn.ModTime().IsZero() {
+				fsn.SetModTime(time.Now())
+			}
+			return fsn.Commit()
 		}
 
 		// If continuing, our depth has increased by one
@@ -142,11 +149,7 @@ func Append(ctx context.Context, basen ipld.Node, db *h.DagBuilderHelper) (out i
 			}
 		}
 	}
-	_, err = fsn.Commit()
-	if err != nil {
-		return nil, err
-	}
-	return fsn.GetDagNode()
+	return fsn.Commit()
 }
 
 func appendFillLastChild(ctx context.Context, fsn *h.FSNodeOverDag, depth int, repeatNumber int, db *h.DagBuilderHelper) error {

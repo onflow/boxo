@@ -209,7 +209,8 @@ type ContentPathMetadata struct {
 	PathSegmentRoots     []cid.Cid
 	LastSegment          path.ImmutablePath
 	LastSegmentRemainder []string
-	ContentType          string // Only used for UnixFS requests
+	ContentType          string    // Only used for UnixFS requests
+	ModTime              time.Time // Optional, non-zero values may be present in UnixFS 1.5 DAGs
 }
 
 // ByteRange describes a range request within a UnixFS file. "From" and "To" mostly
@@ -405,6 +406,11 @@ const (
 	// [Subdomain Gateway]: https://specs.ipfs.tech/http-gateways/subdomain-gateway/
 	SubdomainHostnameKey RequestContextKey = "subdomain-hostname"
 
-	// ContentPathKey is the key for the original [http.Request] URL Path, as an [ipath.Path].
+	// OriginalPathKey is the key for the original [http.Request] [url.URL.Path],
+	// as a string. This is the original path of the request, before [NewHostnameHandler].
+	OriginalPathKey RequestContextKey = "original-path-key"
+
+	// ContentPathKey is the key for the content [path.Path] of the current request.
+	// This already accounts with changes made with [NewHostnameHandler].
 	ContentPathKey RequestContextKey = "content-path"
 )

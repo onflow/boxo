@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
 	"mime"
 	"net/http"
@@ -42,26 +41,6 @@ var (
 	onlyASCII = regexp.MustCompile("[[:^ascii:]]")
 	noModtime = time.Unix(0, 0) // disables Last-Modified header if passed as modtime
 )
-
-// HTML-based redirect for errors which can be recovered from, but we want
-// to provide hint to people that they should fix things on their end.
-var redirectTemplate = template.Must(template.New("redirect").Parse(`<!DOCTYPE html>
-<html>
-	<head>
-		<meta charset="utf-8">
-		<meta http-equiv="refresh" content="10;url={{.RedirectURL}}" />
-		<link rel="canonical" href="{{.RedirectURL}}" />
-	</head>
-	<body>
-		<pre>{{.ErrorMsg}}</pre><pre>(if a redirect does not happen in 10 seconds, use "{{.SuggestedPath}}" instead)</pre>
-	</body>
-</html>`))
-
-type redirectTemplateData struct {
-	RedirectURL   string
-	SuggestedPath string
-	ErrorMsg      string
-}
 
 // handler is a HTTP handler that serves IPFS objects (accessible by default at /ipfs/<path>)
 // (it serves requests like GET /ipfs/QmVRzPKPzNtSrEzBFm2UZfxmPAgnaLke4DMcerbsGGSaFe/link)
@@ -280,6 +259,8 @@ func (i *handler) getOrHeadHandler(w http.ResponseWriter, r *http.Request) {
 		responseParams: formatParams,
 	}
 
+	addContentLocation(r, w, rq)
+
 	// IPNS Record response format can be handled now, since (1) it needs the
 	// non-resolved mutable path, and (2) has custom If-None-Match header handling
 	// due to custom ETag.
@@ -316,6 +297,11 @@ func (i *handler) getOrHeadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Detect when If-None-Match HTTP header allows returning HTTP 304 Not Modified.
 	if i.handleIfNoneMatch(w, r, rq) {
+		return
+	}
+
+	// Detect when If-Modified-Since HTTP header + UnixFS 1.5 allow returning HTTP 304 Not Modified.
+	if i.handleIfModifiedSince(w, r, rq) {
 		return
 	}
 
@@ -429,18 +415,25 @@ func addCacheControlHeaders(w http.ResponseWriter, r *http.Request, contentPath 
 		}
 
 		if lastMod.IsZero() {
-			// Otherwise, we set Last-Modified to the current time to leverage caching heuristics
+			// If no lastMod, set Last-Modified to the current time to leverage caching heuristics
 			// built into modern browsers: https://github.com/ipfs/kubo/pull/8074#pullrequestreview-645196768
 			modtime = time.Now()
 		} else {
+			// set Last-Modified to a meaningful value e.g. one read from dag-pb (UnixFS 1.5, mtime field)
+			// or the last time DNSLink / IPNS Record was modified / resoved or cache
 			modtime = lastMod
 		}
+
 	} else {
 		w.Header().Set("Cache-Control", immutableCacheControl)
-		modtime = noModtime // disable Last-Modified
 
-		// TODO: consider setting Last-Modified if UnixFS V1.5 ever gets released
-		// with metadata: https://github.com/ipfs/kubo/issues/6920
+		if lastMod.IsZero() {
+			// (noop) skip Last-Modified on immutable response
+			modtime = noModtime
+		} else {
+			// set Last-Modified to value read from dag-pb (UnixFS 1.5, mtime field)
+			modtime = lastMod
+		}
 	}
 
 	return modtime
@@ -526,6 +519,21 @@ func setIpfsRootsHeader(w http.ResponseWriter, rq *requestData, md *ContentPathM
 	w.Header().Set("X-Ipfs-Roots", rootCidList)
 }
 
+// lastModifiedMatch returns true if we can respond with HTTP 304 Not Modified
+// It compares If-Modified-Since with logical modification time read from DAG
+// (e.g. UnixFS 1.5 modtime, if present)
+func lastModifiedMatch(ifModifiedSinceHeader string, lastModified time.Time) bool {
+	if ifModifiedSinceHeader == "" || lastModified.IsZero() {
+		return false
+	}
+	ifModifiedSinceTime, err := time.Parse(time.RFC1123, ifModifiedSinceHeader)
+	if err != nil {
+		return false
+	}
+	// ignoring fractional seconds (as HTTP dates don't include fractional seconds)
+	return !lastModified.Truncate(time.Second).After(ifModifiedSinceTime)
+}
+
 // etagMatch evaluates if we can respond with HTTP 304 Not Modified
 // It supports multiple weak and strong etags passed in If-None-Match string
 // including the wildcard one.
@@ -607,6 +615,27 @@ const (
 	ipnsRecordResponseFormat = "application/vnd.ipfs.ipns-record"
 )
 
+var (
+	formatParamToResponseFormat = map[string]string{
+		"raw":         rawResponseFormat,
+		"car":         carResponseFormat,
+		"tar":         tarResponseFormat,
+		"json":        jsonResponseFormat,
+		"cbor":        cborResponseFormat,
+		"dag-json":    dagJsonResponseFormat,
+		"dag-cbor":    dagCborResponseFormat,
+		"ipns-record": ipnsRecordResponseFormat,
+	}
+
+	responseFormatToFormatParam = map[string]string{}
+)
+
+func init() {
+	for k, v := range formatParamToResponseFormat {
+		responseFormatToFormatParam[v] = k
+	}
+}
+
 // return explicit response format if specified in request as query parameter or via Accept HTTP header
 func customResponseFormat(r *http.Request) (mediaType string, params map[string]string, err error) {
 	// First, inspect Accept header, as it may not only include content type, but also optional parameters.
@@ -636,29 +665,54 @@ func customResponseFormat(r *http.Request) (mediaType string, params map[string]
 
 	// If no Accept header, translate query param to a content type, if present.
 	if formatParam := r.URL.Query().Get("format"); formatParam != "" {
-		switch formatParam {
-		case "raw":
-			return rawResponseFormat, nil, nil
-		case "car":
-			return carResponseFormat, nil, nil
-		case "tar":
-			return tarResponseFormat, nil, nil
-		case "json":
-			return jsonResponseFormat, nil, nil
-		case "cbor":
-			return cborResponseFormat, nil, nil
-		case "dag-json":
-			return dagJsonResponseFormat, nil, nil
-		case "dag-cbor":
-			return dagCborResponseFormat, nil, nil
-		case "ipns-record":
-			return ipnsRecordResponseFormat, nil, nil
+		if responseFormat, ok := formatParamToResponseFormat[formatParam]; ok {
+			return responseFormat, nil, nil
 		}
 	}
 
 	// If none of special-cased content types is found, return empty string
 	// to indicate default, implicit UnixFS response should be prepared
 	return "", nil, nil
+}
+
+// Add 'Content-Location' headers for non-default response formats. This allows
+// correct caching of such format requests when the format is passed via the
+// Accept header, for example.
+func addContentLocation(r *http.Request, w http.ResponseWriter, rq *requestData) {
+	// Skip Content-Location if no explicit format was requested
+	// via Accept HTTP header or ?format URL param
+	if rq.responseFormat == "" {
+		return
+	}
+
+	format := responseFormatToFormatParam[rq.responseFormat]
+
+	// Skip Content-Location if there is no conflict between
+	// 'format' in URL and value in 'Accept' header.
+	// If both are present and don't match, we continue and generate
+	// Content-Location to ensure value from Accept overrides 'format' from URL.
+	if urlFormat := r.URL.Query().Get("format"); urlFormat != "" && urlFormat == format {
+		return
+	}
+
+	path := r.URL.Path
+	if p, ok := r.Context().Value(OriginalPathKey).(string); ok {
+		path = p
+	}
+
+	// Copy all existing query parameters.
+	query := url.Values{}
+	for k, v := range r.URL.Query() {
+		query[k] = v
+	}
+	query.Set("format", format)
+
+	// Set response params as query elements.
+	for k, v := range rq.responseParams {
+		query.Set(format+"-"+k, v)
+	}
+
+	w.Header().Set("Content-Location", path+"?"+query.Encode())
 }
 
 // returns unquoted path with all special characters revealed as \u codes
@@ -715,6 +769,50 @@ func (i *handler) handleIfNoneMatch(w http.ResponseWriter, r *http.Request, rq *
 		return false
 	}
 
+	return false
+}
+
+func (i *handler) handleIfModifiedSince(w http.ResponseWriter, r *http.Request, rq *requestData) bool {
+	// Detect when If-Modified-Since HTTP header allows returning HTTP 304 Not Modified
+	ifModifiedSince := r.Header.Get("If-Modified-Since")
+	if ifModifiedSince == "" {
+		return false
+	}
+
+	// Resolve path to be able to read pathMetadata.ModTime
+	pathMetadata, err := i.backend.ResolvePath(r.Context(), rq.immutablePath)
+	if err != nil {
+		var forwardedPath path.ImmutablePath
+		var continueProcessing bool
+		if isWebRequest(rq.responseFormat) {
+			forwardedPath, continueProcessing = i.handleWebRequestErrors(w, r, rq.mostlyResolvedPath(), rq.immutablePath, rq.contentPath, err, rq.logger)
+			if continueProcessing {
+				pathMetadata, err = i.backend.ResolvePath(r.Context(), forwardedPath)
+			}
+		}
+		if !continueProcessing || err != nil {
+			err = fmt.Errorf("failed to resolve %s: %w", debugStr(rq.contentPath.String()), err)
+			i.webError(w, r, err, http.StatusInternalServerError)
+			return true
+		}
+	}
+
+	// Currently we only care about optional mtime from UnixFS 1.5 (dag-pb)
+	// but other sources of this metadata could be added in the future
+	lastModified := pathMetadata.ModTime
+	if lastModifiedMatch(ifModifiedSince, lastModified) {
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+
+	// Check if the resolvedPath is an immutable path.
+	_, err = path.NewImmutablePath(pathMetadata.LastSegment)
+	if err != nil {
+		i.webError(w, r, err, http.StatusInternalServerError)
+		return true
+	}
+
+	rq.pathMetadata = &pathMetadata
 	return false
 }
 
@@ -808,9 +906,10 @@ func handleProtocolHandlerRedirect(w http.ResponseWriter, r *http.Request, c *Co
 			webError(w, r, c, fmt.Errorf("uri query parameter scheme must be ipfs or ipns: %w", err), http.StatusBadRequest)
 			return true
 		}
-		path := u.Path
+
+		path := u.EscapedPath()
 		if u.RawQuery != "" { // preserve query if present
-			path = path + "?" + u.RawQuery
+			path += "?" + url.PathEscape(u.RawQuery)
 		}
 
 		redirectURL := gopath.Join("/", u.Scheme, u.Host, path)
@@ -891,7 +990,7 @@ func (i *handler) handleSuperfluousNamespace(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Attempt to fix the superflous namespace
-	intendedPath, err := path.NewPath(strings.TrimPrefix(r.URL.Path, "/ipfs"))
+	intendedPath, err := path.NewPath(strings.TrimPrefix(r.URL.EscapedPath(), "/ipfs"))
 	if err != nil {
 		i.webError(w, r, fmt.Errorf("invalid ipfs path: %w", err), http.StatusBadRequest)
 		return true
@@ -903,21 +1002,8 @@ func (i *handler) handleSuperfluousNamespace(w http.ResponseWriter, r *http.Requ
 		q, _ := url.ParseQuery(r.URL.RawQuery)
 		intendedURL = intendedURL + "?" + q.Encode()
 	}
-	// return HTTP 400 (Bad Request) with HTML error page that:
-	// - points at correct canonical path via <link> header
-	// - displays human-readable error
-	// - redirects to intendedURL after a short delay
 
-	w.WriteHeader(http.StatusBadRequest)
-	err = redirectTemplate.Execute(w, redirectTemplateData{
-		RedirectURL:   intendedURL,
-		SuggestedPath: intendedPath.String(),
-		ErrorMsg:      fmt.Sprintf("invalid path: %q should be %q", r.URL.Path, intendedPath.String()),
-	})
-	if err != nil {
-		_, _ = w.Write([]byte(fmt.Sprintf("error during body generation: %v", err)))
-	}
-
+	http.Redirect(w, r, intendedURL, http.StatusMovedPermanently)
 	return true
 }
 

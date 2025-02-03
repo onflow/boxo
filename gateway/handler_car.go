@@ -14,7 +14,6 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/ipfs/boxo/path"
 	"github.com/ipfs/go-cid"
-
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/multierr"
@@ -23,6 +22,9 @@ import (
 const (
 	carRangeBytesKey          = "entity-bytes"
 	carTerminalElementTypeKey = "dag-scope"
+	carVersionKey             = "car-version"
+	carDuplicatesKey          = "car-dups"
+	carOrderKey               = "car-order"
 )
 
 // serveCAR returns a CAR stream for specific DAG+selector
@@ -144,8 +146,23 @@ func buildCarParams(r *http.Request, contentTypeParams map[string]string) (CarPa
 
 	// application/vnd.ipld.car content type parameters from Accept header
 
+	// Get CAR version, duplicates and order from the query parameters and override
+	// with parameters from Accept header if they exist, since they have priority.
+	versionStr := queryParams.Get(carVersionKey)
+	duplicatesStr := queryParams.Get(carDuplicatesKey)
+	orderStr := queryParams.Get(carOrderKey)
+	if v, ok := contentTypeParams["version"]; ok {
+		versionStr = v
+	}
+	if v, ok := contentTypeParams["order"]; ok {
+		orderStr = v
+	}
+	if v, ok := contentTypeParams["dups"]; ok {
+		duplicatesStr = v
+	}
+
 	// version of CAR format
-	switch contentTypeParams["version"] {
+	switch versionStr {
 	case "": // noop, client does not care about version
 	case "1": // noop, we support this
 	default:
@@ -153,7 +170,7 @@ func buildCarParams(r *http.Request, contentTypeParams map[string]string) (CarPa
 	}
 
 	// optional order from IPIP-412
-	if order := DagOrder(contentTypeParams["order"]); order != DagOrderUnspecified {
+	if order := DagOrder(orderStr); order != DagOrderUnspecified {
 		switch order {
 		case DagOrderUnknown, DagOrderDFS:
 			params.Order = order
@@ -168,7 +185,7 @@ func buildCarParams(r *http.Request, contentTypeParams map[string]string) (CarPa
 	}
 
 	// optional dups from IPIP-412
-	dups, err := NewDuplicateBlocksPolicy(contentTypeParams["dups"])
+	dups, err := NewDuplicateBlocksPolicy(duplicatesStr)
 	if err != nil {
 		return CarParams{}, err
 	}

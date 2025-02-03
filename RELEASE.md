@@ -52,7 +52,7 @@ At least as of 2023-06-08, changelog test is manually copied from [the changelog
 ### Related Work
 Below are links of related/adjacent work that has informed some of the decisions in this document:
 1. https://github.com/ipfs/boxo/issues/170
-2. https://pl-strflt.notion.site/Kubo-Release-Process-5a5d066264704009a28a79cff93062c4
+2. https://ipshipyard.notion.site/Kubo-Release-Process-6dba4f5755c9458ab5685eeb28173778
 3. https://github.com/ipfs/kubo/blob/master/docs/RELEASE_ISSUE_TEMPLATE.md
 
 ## Release Process
@@ -63,17 +63,17 @@ Below are links of related/adjacent work that has informed some of the decisions
 - [ ] Verify your [GPG signature](https://docs.github.com/en/authentication/managing-commit-signature-verification) is configured in local git and GitHub
 - [ ] Ensure Boxo and Kubo are checked out on your system
 - [ ] Create a release branch called `release-vX.Y.Z` and push it
-  * Use `master` as base if `Z == 0`
-  * Use `release` as base if `Z > 0`
+  * Use `main` as base if `Z == 0`
+  * Use `release-X.Y.Z-1` as base if `Z > 0`
 - [ ] Tidy the changelog and push any changelog changes to `release-vX.Y.Z`
-- [ ] Create a draft PR merging `release-vX.Y.Z` into `release`
+- [ ] Create a draft PR merging `release-vX.Y.Z` into `main`
   - [ ] Name it "Release vX.Y.Z"
   - [ ] Reference this release issue
 - [ ] If `Z > 0`, then cherry-pick the necessary commits from `master` into `release-vX.Y.Z` using `git cherry-pick -x <commit>`
 - [ ] Ensure Boxo tests are passing
 - [ ] Ensure Kubo tests are passing
   - [ ] Go to Kubo dir and run `go get github.com/ipfs/boxo@<commit_hash>` using the commit hash of the `release-vX.Y.Z` branch
-  - [ ] Run `go mod tidy` in repo root and in `docs/examples/kubo-as-a-library`
+  - [ ] Run `make mod_tidy` in repo root (to apply `go mod tidy` to code, tests, and examples)
   - [ ] Commit the changes and open a draft PR in Kubo
   - [ ] Name the PR "Upgrade to Boxo vX.Y.Z"
   - [ ] Paste a link to the Kubo PR in the Boxo PR, so reviewers can verify the Kubo test run
@@ -82,14 +82,10 @@ Below are links of related/adjacent work that has informed some of the decisions
 - [ ] Add a "release" label to the Boxo PR
 - [ ] After the release checker creates a draft release, copy-paste the changelog into the draft
 - [ ] Wait for approval from another Boxo maintainer
-- [ ] Merge the PR into `release`, _using "Create a Merge Commit"_, and do not delete the `release-vX.Y.X` branch
+- [ ] Merge the PR into `main`, _using "Create a Merge Commit"_, and do not delete the `release-vX.Y.X` branch
   - [ ] Verify the tag is created
 - [ ] Announce the release
-  - [ ] Click [this link](https://discuss.ipfs.tech/new-topic?title=Boxo%20vX.Y.Z%20is%20out%21&tags=boxo&category=News&body=%23%23%20Boxo%20vX.Y.Z%20is%20out%21%0A%0ASee%3A%0A-%20Code%3A%20https%3A%2F%2Fgithub.com%2Fipfs%2Fboxo%2Freleases%2Ftag%2FvX.Y.Z%0A-%20Release%20Notes%3A%20https%3A%2F%2Fgithub.com%2Fipfs%2Fboxo%2Fblob%2Frelease-vX.Y.Z%2FCHANGELOG.md) to start a new Discourse topic <!--docs: https://meta.discourse.org/t/create-a-link-to-start-a-new-topic-with-pre-filled-information/28074 -->
+  - [ ] Click [this link](https://discuss.ipfs.tech/new-topic?title=Boxo%20vX.Y.Z%20is%20out%21&tags=boxo&category=News&body=%23%23%20Boxo%20vX.Y.Z%20is%20out%21%0A%0ASee%3A%0A-%20Code%3A%20https%3A%2F%2Fgithub.com%2Fipfs%2Fboxo%2Freleases%2Ftag%2FvX.Y.Z%0A-%20Release%20Notes%3A%20https%3A%2F%2Fgithub.com%2Fipfs%2Fboxo%2Fblob%2FvX.Y.Z%2FCHANGELOG.md) to start a new Discourse topic <!--docs: https://meta.discourse.org/t/create-a-link-to-start-a-new-topic-with-pre-filled-information/28074 -->
     - [ ] Update `vX.Y.Z` in the title and body
 	- [ ] Create the topic
-- [ ] Create a PR merging `release` into `main`
-  - [ ] Name it "Merge release vX.Y.Z"
-  - [ ] Wait for approval
-  - [ ] Merge it _using "Create a Merge Commit"_, and do not delete the `release` branch
 - [ ] Update the Kubo PR to use the newly released version, mark it as "Ready for Review", get approval, and merge into Kubo

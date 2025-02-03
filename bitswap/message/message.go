@@ -7,19 +7,18 @@ import (
 
 	"github.com/ipfs/boxo/bitswap/client/wantlist"
 	pb "github.com/ipfs/boxo/bitswap/message/pb"
-
+	u "github.com/ipfs/boxo/util"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	pool "github.com/libp2p/go-buffer-pool"
-	msgio "github.com/libp2p/go-msgio"
-
-	u "github.com/ipfs/boxo/util"
 	"github.com/libp2p/go-libp2p/core/network"
+	msgio "github.com/libp2p/go-msgio"
 )
 
 // BitSwapMessage is the basic interface for interacting building, encoding,
 // and decoding messages sent on the BitSwap protocol.
 type BitSwapMessage interface {
+	FillWantlist([]Entry) []Entry
 	// Wantlist returns a slice of unique keys that represent data wanted by
 	// the sender.
 	Wantlist() []Entry
@@ -116,7 +115,7 @@ func (e *Entry) Size() int {
 func (e *Entry) ToPB() pb.Message_Wantlist_Entry {
 	return pb.Message_Wantlist_Entry{
 		Block:        pb.Cid{Cid: e.Cid},
-		Priority:     int32(e.Priority),
+		Priority:     e.Priority,
 		Cancel:       e.Cancel,
 		WantType:     e.WantType,
 		SendDontHave: e.SendDontHave,
@@ -182,15 +181,9 @@ func (m *impl) Clone() BitSwapMessage {
 // Reset the values in the message back to defaults, so it can be reused
 func (m *impl) Reset(full bool) {
 	m.full = full
-	for k := range m.wantlist {
-		delete(m.wantlist, k)
-	}
-	for k := range m.blocks {
-		delete(m.blocks, k)
-	}
-	for k := range m.blockPresences {
-		delete(m.blockPresences, k)
-	}
+	clear(m.wantlist)
+	clear(m.blocks)
+	clear(m.blockPresences)
 	m.pendingBytes = 0
 }
 
@@ -252,26 +245,44 @@ func (m *impl) Empty() bool {
 	return len(m.blocks) == 0 && len(m.wantlist) == 0 && len(m.blockPresences) == 0
 }
 
-func (m *impl) Wantlist() []Entry {
-	out := make([]Entry, 0, len(m.wantlist))
+func (m *impl) FillWantlist(out []Entry) []Entry {
+	if cap(out) < len(m.wantlist) {
+		out = make([]Entry, len(m.wantlist))
+	}
+	var i int
 	for _, e := range m.wantlist {
-		out = append(out, *e)
+		out[i] = *e
+		i++
+	}
+	return out
+}
+
+func (m *impl) Wantlist() []Entry {
+	out := make([]Entry, len(m.wantlist))
+	var i int
+	for _, e := range m.wantlist {
+		out[i] = *e
+		i++
 	}
 	return out
 }
 
 func (m *impl) Blocks() []blocks.Block {
-	bs := make([]blocks.Block, 0, len(m.blocks))
+	bs := make([]blocks.Block, len(m.blocks))
+	var i int
 	for _, block := range m.blocks {
-		bs = append(bs, block)
+		bs[i] = block
+		i++
 	}
 	return bs
 }
 
 func (m *impl) BlockPresences() []BlockPresence {
-	bps := make([]BlockPresence, 0, len(m.blockPresences))
+	bps := make([]BlockPresence, len(m.blockPresences))
+	var i int
 	for c, t := range m.blockPresences {
-		bps = append(bps, BlockPresence{c, t})
+		bps[i] = BlockPresence{c, t}
+		i++
 	}
 	return bps
 }

@@ -6,11 +6,10 @@ import (
 
 	bsmsg "github.com/ipfs/boxo/bitswap/message"
 	"github.com/ipfs/boxo/bitswap/network/internal"
-
 	cid "github.com/ipfs/go-cid"
-
 	"github.com/libp2p/go-libp2p/core/connmgr"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 )
 
@@ -19,7 +18,7 @@ var (
 	ProtocolBitswapNoVers = internal.ProtocolBitswapNoVers
 	// ProtocolBitswapOneZero is the prefix for the legacy bitswap protocol
 	ProtocolBitswapOneZero = internal.ProtocolBitswapOneZero
-	// ProtocolBitswapOneOne is the the prefix for version 1.1.0
+	// ProtocolBitswapOneOne is the prefix for version 1.1.0
 	ProtocolBitswapOneOne = internal.ProtocolBitswapOneOne
 	// ProtocolBitswap is the current version of the bitswap protocol: 1.2.0
 	ProtocolBitswap = internal.ProtocolBitswap
@@ -40,7 +39,7 @@ type BitSwapNetwork interface {
 	// Stop stops the network service.
 	Stop()
 
-	ConnectTo(context.Context, peer.ID) error
+	Connect(context.Context, peer.AddrInfo) error
 	DisconnectFrom(context.Context, peer.ID) error
 
 	NewMessageSender(context.Context, peer.ID, *MessageSenderOpts) (MessageSender, error)
@@ -48,8 +47,6 @@ type BitSwapNetwork interface {
 	ConnectionManager() connmgr.ConnManager
 
 	Stats() Stats
-
-	Routing
 
 	Pinger
 }
@@ -87,8 +84,7 @@ type Receiver interface {
 // Routing is an interface to providing and finding providers on a bitswap
 // network.
 type Routing interface {
-	// FindProvidersAsync returns a channel of providers for the given key.
-	FindProvidersAsync(context.Context, cid.Cid, int) <-chan peer.ID
+	routing.ContentDiscovery
 
 	// Provide provides the key to the network.
 	Provide(context.Context, cid.Cid) error

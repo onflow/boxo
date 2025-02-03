@@ -16,17 +16,16 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/ipfs/boxo/ipld/merkledag"
-	mdpb "github.com/ipfs/boxo/ipld/merkledag/pb"
-	dstest "github.com/ipfs/boxo/ipld/merkledag/test"
-
 	bserv "github.com/ipfs/boxo/blockservice"
 	bstest "github.com/ipfs/boxo/blockservice/test"
 	offline "github.com/ipfs/boxo/exchange/offline"
-	u "github.com/ipfs/boxo/util"
+	. "github.com/ipfs/boxo/ipld/merkledag"
+	mdpb "github.com/ipfs/boxo/ipld/merkledag/pb"
+	dstest "github.com/ipfs/boxo/ipld/merkledag/test"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
+	"github.com/ipfs/go-test/random"
 	prime "github.com/ipld/go-ipld-prime"
 	mh "github.com/multiformats/go-multihash"
 )
@@ -353,7 +352,7 @@ func (devZero) Read(b []byte) (int, error) {
 }
 
 func TestBatchFetch(t *testing.T) {
-	read := io.LimitReader(u.NewTimeSeededRand(), 1024*32)
+	read := io.LimitReader(random.NewRand(), 1024*32)
 	runBatchFetchTest(t, read)
 }
 
@@ -513,7 +512,7 @@ func TestFetchGraph(t *testing.T) {
 		dservs = append(dservs, NewDAGService(bsi))
 	}
 
-	read := io.LimitReader(u.NewTimeSeededRand(), 1024*32)
+	read := io.LimitReader(random.NewRand(), 1024*32)
 	root := makeTestDAG(t, read, dservs[0])
 
 	err := FetchGraph(context.TODO(), root.Cid(), dservs[1])
@@ -595,7 +594,7 @@ func TestWalk(t *testing.T) {
 	bsi := bstest.Mocks(1)
 	ds := NewDAGService(bsi[0])
 
-	read := io.LimitReader(u.NewTimeSeededRand(), 1024*1024)
+	read := io.LimitReader(random.NewRand(), 1024*1024)
 	root := makeTestDAG(t, read, ds)
 
 	set := cid.NewSet()

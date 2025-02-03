@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	mc "github.com/multiformats/go-multicodec"
-
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -93,6 +92,14 @@ func (i *handler) serveDefaults(ctx context.Context, w http.ResponseWriter, r *h
 	}
 
 	setIpfsRootsHeader(w, rq, &pathMetadata)
+
+	// On deserialized responses, we prefer Last-Modified from pathMetadata
+	// (mtime in UnixFS 1.5 DAG). This also applies to /ipns/, because value
+	// from dag-pb, if present, is more meaningful than lastMod inferred from
+	// namesys.
+	if !pathMetadata.ModTime.IsZero() {
+		rq.lastMod = pathMetadata.ModTime
+	}
 
 	resolvedPath := pathMetadata.LastSegment
 	switch mc.Code(resolvedPath.RootCid().Prefix().Codec) {

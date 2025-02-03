@@ -9,12 +9,15 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	gourl "net/url"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/benbjohnson/clock"
+	"github.com/filecoin-project/go-clock"
 	ipns "github.com/ipfs/boxo/ipns"
 	"github.com/ipfs/boxo/routing/http/contentrouter"
+	"github.com/ipfs/boxo/routing/http/filters"
 	"github.com/ipfs/boxo/routing/http/internal/drjson"
 	"github.com/ipfs/boxo/routing/http/types"
 	"github.com/ipfs/boxo/routing/http/types/iter"
@@ -28,15 +31,10 @@ import (
 )
 
 var (
-	_                 contentrouter.Client = &Client{}
-	logger                                 = logging.Logger("routing/http/client")
-	defaultHTTPClient                      = &http.Client{
-		Transport: &ResponseBodyLimitedTransport{
-			RoundTripper: http.DefaultTransport,
-			LimitBytes:   1 << 20,
-			UserAgent:    defaultUserAgent,
-		},
-	}
+	_      contentrouter.Client = &Client{}
+	logger                      = logging.Logger("routing/http/client")
+
+	DefaultProtocolFilter = []string{"unknown", "transport-bitswap"} // IPIP-484
 )
 
 const (
@@ -57,8 +55,14 @@ type Client struct {
 
 	// Called immediately after signing a provide request. It is used
 	// for testing, e.g., testing the server with a mangled signature.
+	//nolint:staticcheck
 	//lint:ignore SA1019 // ignore staticcheck
 	afterSignCallback func(req *types.WriteBitswapRecord)
+
+	// disableLocalFiltering is used to disable local filtering of the results
+	disableLocalFiltering bool
+	protocolFilter        []string
+	addrFilter            []string
 }
 
 // defaultUserAgent is used as a fallback to inform HTTP server which library
@@ -67,53 +71,106 @@ var defaultUserAgent = moduleVersion()
 
 var _ contentrouter.Client = &Client{}
 
+func newDefaultHTTPClient(userAgent string) *http.Client {
+	return &http.Client{
+		Transport: &ResponseBodyLimitedTransport{
+			RoundTripper: http.DefaultTransport,
+			LimitBytes:   1 << 20,
+			UserAgent:    userAgent,
+		},
+	}
+}
+
 type httpClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-type Option func(*Client)
+type Option func(*Client) error
 
 func WithIdentity(identity crypto.PrivKey) Option {
-	return func(c *Client) {
+	return func(c *Client) error {
 		c.identity = identity
+		return nil
 	}
 }
 
+// WithDisabledLocalFiltering disables local filtering of the results.
+// This should be used for delegated routing servers that already implement filtering
+func WithDisabledLocalFiltering(val bool) Option {
+	return func(c *Client) error {
+		c.disableLocalFiltering = val
+		return nil
+	}
+}
+
+// WithProtocolFilter adds a protocol filter to the client.
+// The protocol filter is added to the request URL.
+// The protocols are ordered alphabetically for cache key (url) consistency
+func WithProtocolFilter(protocolFilter []string) Option {
+	return func(c *Client) error {
+		slices.Sort(protocolFilter)
+		c.protocolFilter = protocolFilter
+		return nil
+	}
+}
+
+// WithAddrFilter adds an address filter to the client.
+// The address filter is added to the request URL.
+// The addresses are ordered alphabetically for cache key (url) consistency
+func WithAddrFilter(addrFilter []string) Option {
+	return func(c *Client) error {
+		slices.Sort(addrFilter)
+		c.addrFilter = addrFilter
+		return nil
+	}
+}
+
+// WithHTTPClient sets a custom HTTP Client to be used with [Client].
 func WithHTTPClient(h httpClient) Option {
-	return func(c *Client) {
+	return func(c *Client) error {
 		c.httpClient = h
+		return nil
 	}
 }
 
+// WithUserAgent sets a custom user agent to use with the HTTP Client. This modifies
+// the underlying [http.Client]. Therefore, you should not use the same HTTP Client
+// with multiple routing clients.
+//
+// This only works if using a [http.Client] with a [ResponseBodyLimitedTransport]
+// set as its transport. Otherwise, an error will be returned.
 func WithUserAgent(ua string) Option {
-	return func(c *Client) {
+	return func(c *Client) error {
 		if ua == "" {
-			return
+			return errors.New("empty user agent")
 		}
 		httpClient, ok := c.httpClient.(*http.Client)
 		if !ok {
-			return
+			return errors.New("the http client of the Client must be a *http.Client")
 		}
 		transport, ok := httpClient.Transport.(*ResponseBodyLimitedTransport)
 		if !ok {
-			return
+			return errors.New("the transport of the http client of the Client must be a *ResponseBodyLimitedTransport")
 		}
 		transport.UserAgent = ua
+		return nil
 	}
 }
 
 func WithProviderInfo(peerID peer.ID, addrs []multiaddr.Multiaddr) Option {
-	return func(c *Client) {
+	return func(c *Client) error {
 		c.peerID = peerID
 		for _, a := range addrs {
 			c.addrs = append(c.addrs, types.Multiaddr{Multiaddr: a})
 		}
+		return nil
 	}
 }
 
 func WithStreamResultsRequired() Option {
-	return func(c *Client) {
+	return func(c *Client) error {
 		c.accepts = mediaTypeNDJSON
+		return nil
 	}
 }
 
@@ -121,14 +178,18 @@ func WithStreamResultsRequired() Option {
 // The Provider and identity parameters are option. If they are nil, the [client.ProvideBitswap] method will not function.
 func New(baseURL string, opts ...Option) (*Client, error) {
 	client := &Client{
-		baseURL:    baseURL,
-		httpClient: defaultHTTPClient,
-		clock:      clock.New(),
-		accepts:    strings.Join([]string{mediaTypeNDJSON, mediaTypeJSON}, ","),
+		baseURL:        baseURL,
+		httpClient:     newDefaultHTTPClient(defaultUserAgent),
+		clock:          clock.New(),
+		accepts:        strings.Join([]string{mediaTypeNDJSON, mediaTypeJSON}, ","),
+		protocolFilter: DefaultProtocolFilter, // can be customized via WithProtocolFilter
 	}
 
 	for _, opt := range opts {
-		opt(client)
+		err := opt(client)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if client.identity != nil && client.peerID.Size() != 0 && !client.peerID.MatchesPublicKey(client.identity.GetPublic()) {
@@ -166,7 +227,12 @@ func (c *Client) FindProviders(ctx context.Context, key cid.Cid) (providers iter
 	// TODO test measurements
 	m := newMeasurement("FindProviders")
 
-	url := c.baseURL + "/routing/v1/providers/" + key.String()
+	url, err := gourl.JoinPath(c.baseURL, "routing/v1/providers", key.String())
+	if err != nil {
+		return nil, err
+	}
+	url = filters.AddFiltersToURL(url, c.protocolFilter, c.addrFilter)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -233,6 +299,10 @@ func (c *Client) FindProviders(ctx context.Context, key cid.Cid) (providers iter
 		return nil, errors.New("unknown content type")
 	}
 
+	if !c.disableLocalFiltering {
+		it = filters.ApplyFiltersToIter(it, c.addrFilter, c.protocolFilter)
+	}
+
 	return &measuringIter[iter.Result[types.Record]]{Iter: it, ctx: ctx, m: m}, nil
 }
 
@@ -284,8 +354,10 @@ func (c *Client) ProvideBitswap(ctx context.Context, keys []cid.Cid, ttl time.Du
 
 // ProvideAsync makes a provide request to a delegated router
 //
+//nolint:staticcheck
 //lint:ignore SA1019 // ignore staticcheck
 func (c *Client) provideSignedBitswapRecord(ctx context.Context, bswp *types.WriteBitswapRecord) (time.Duration, error) {
+	//nolint:staticcheck
 	//lint:ignore SA1019 // ignore staticcheck
 	req := jsontypes.WriteProvidersRequest{Providers: []types.Record{bswp}}
 
@@ -338,7 +410,12 @@ func (c *Client) provideSignedBitswapRecord(ctx context.Context, bswp *types.Wri
 func (c *Client) FindPeers(ctx context.Context, pid peer.ID) (peers iter.ResultIter[*types.PeerRecord], err error) {
 	m := newMeasurement("FindPeers")
 
-	url := c.baseURL + "/routing/v1/peers/" + peer.ToCid(pid).String()
+	url, err := gourl.JoinPath(c.baseURL, "routing/v1/peers", peer.ToCid(pid).String())
+	if err != nil {
+		return nil, err
+	}
+	url = filters.AddFiltersToURL(url, c.protocolFilter, c.addrFilter)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -403,6 +480,10 @@ func (c *Client) FindPeers(ctx context.Context, pid peer.ID) (peers iter.ResultI
 	default:
 		logger.Errorw("unknown media type", "MediaType", mediaType, "ContentType", respContentType)
 		return nil, errors.New("unknown content type")
+	}
+
+	if !c.disableLocalFiltering {
+		it = filters.ApplyFiltersToPeerRecordIter(it, c.addrFilter, c.protocolFilter)
 	}
 
 	return &measuringIter[iter.Result[*types.PeerRecord]]{Iter: it, ctx: ctx, m: m}, nil

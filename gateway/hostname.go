@@ -12,7 +12,6 @@ import (
 	cid "github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/peer"
 	dns "github.com/miekg/dns"
-
 	mbase "github.com/multiformats/go-multibase"
 )
 
@@ -27,6 +26,9 @@ func NewHostnameHandler(c Config, backend IPFSBackend, next http.Handler) http.H
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer panicHandler(w)
+
+		ctx := context.WithValue(r.Context(), OriginalPathKey, r.URL.Path)
+		r = r.WithContext(ctx)
 
 		// First check for protocol handler redirects.
 		if handleProtocolHandlerRedirect(w, r, &c) {
@@ -179,7 +181,6 @@ func NewHostnameHandler(c Config, backend IPFSBackend, next http.Handler) http.H
 						// Un-inlined DNS name has a valid DNSLink record.
 						// Update path prefix to use un-inlined FQDN in gateway processing.
 						pathPrefix = "/ipns/" + dnslinkFQDN // → /ipns/my.v-long.example.com
-
 					} else if !hasDNSLinkRecord(r.Context(), backend, rootID) {
 						// Inspected _dnslink.my-v--long-example-com as a
 						// fallback, but it had no DNSLink record either.
@@ -190,7 +191,6 @@ func NewHostnameHandler(c Config, backend IPFSBackend, next http.Handler) http.H
 						// about missing DNSLink will use the un-inlined FQDN,
 						// and not the inlined one.
 						pathPrefix = "/ipns/" + dnslinkFQDN
-
 					}
 				}
 			}

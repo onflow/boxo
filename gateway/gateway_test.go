@@ -20,7 +20,7 @@ import (
 )
 
 func TestGatewayGet(t *testing.T) {
-	ts, backend, root := newTestServerAndNode(t, nil, "fixtures.car")
+	ts, backend, root := newTestServerAndNode(t, "fixtures.car")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -96,7 +96,7 @@ func TestGatewayGet(t *testing.T) {
 func TestHeaders(t *testing.T) {
 	t.Parallel()
 
-	ts, backend, root := newTestServerAndNode(t, nil, "headers-test.car")
+	ts, backend, root := newTestServerAndNode(t, "headers-test.car")
 
 	var (
 		rootCID = "bafybeidbcy4u6y55gsemlubd64zk53xoxs73ifd6rieejxcr7xy46mjvky"
@@ -121,7 +121,7 @@ func TestHeaders(t *testing.T) {
 	t.Run("Cache-Control uses TTL for /ipns/ when it is known", func(t *testing.T) {
 		t.Parallel()
 
-		ts, backend, root := newTestServerAndNode(t, nil, "ipns-hostname-redirects.car")
+		ts, backend, root := newTestServerAndNode(t, "ipns-hostname-redirects.car")
 		backend.namesys["/ipns/example.net"] = newMockNamesysItem(path.FromCid(root), time.Second*30)
 		backend.namesys["/ipns/example.com"] = newMockNamesysItem(path.FromCid(root), time.Second*55)
 		backend.namesys["/ipns/unknown.com"] = newMockNamesysItem(path.FromCid(root), 0)
@@ -130,9 +130,9 @@ func TestHeaders(t *testing.T) {
 			path         string
 			cacheControl string
 		}{
-			{"/ipns/example.net/", "public, max-age=30"},                 // As generated directory listing
-			{"/ipns/example.com/", "public, max-age=55"},                 // As generated directory listing (different)
-			{"/ipns/unknown.com/", ""},                                   // As generated directory listing (unknown)
+			{"/ipns/example.net/", "public, max-age=30, stale-while-revalidate=2678400"}, // As generated directory listing
+			{"/ipns/example.com/", "public, max-age=55, stale-while-revalidate=2678400"}, // As generated directory listing (different)
+			{"/ipns/unknown.com/", ""},                                   // As generated directory listing (unknown TTL)
 			{"/ipns/example.net/foo/", "public, max-age=30"},             // As index.html directory listing
 			{"/ipns/example.net/foo/index.html", "public, max-age=30"},   // As deserialized UnixFS file
 			{"/ipns/example.net/?format=raw", "public, max-age=30"},      // As Raw block
@@ -227,6 +227,60 @@ func TestHeaders(t *testing.T) {
 				require.NoError(t, err)
 				defer res.Body.Close()
 				require.Equal(t, http.StatusNotModified, res.StatusCode)
+			})
+		}
+
+		test("", dirPath)
+		test("text/html", dirPath)
+		test(carResponseFormat, dirPath)
+		test(rawResponseFormat, dirPath)
+		test(tarResponseFormat, dirPath)
+
+		test("", hamtFilePath)
+		test("text/html", hamtFilePath)
+		test(carResponseFormat, hamtFilePath)
+		test(rawResponseFormat, hamtFilePath)
+		test(tarResponseFormat, hamtFilePath)
+
+		test("", filePath)
+		test("text/html", filePath)
+		test(carResponseFormat, filePath)
+		test(rawResponseFormat, filePath)
+		test(tarResponseFormat, filePath)
+
+		test("", dagCborPath)
+		test("text/html", dagCborPath+"/")
+		test(carResponseFormat, dagCborPath)
+		test(rawResponseFormat, dagCborPath)
+		test(dagJsonResponseFormat, dagCborPath)
+		test(dagCborResponseFormat, dagCborPath)
+	})
+
+	// We have UnixFS1.5 tests in TestHeadersUnixFSModeModTime, here we test default behavior (DAG without modtime)
+	t.Run("If-Modified-Since is noop against DAG without optional UnixFS 1.5 mtime", func(t *testing.T) {
+		test := func(responseFormat string, path string) {
+			t.Run(responseFormat, func(t *testing.T) {
+				// Make regular request and read Last-Modified
+				url := ts.URL + path
+				req := mustNewRequest(t, http.MethodGet, url, nil)
+				req.Header.Add("Accept", responseFormat)
+				res := mustDoWithoutRedirect(t, req)
+				_, err := io.Copy(io.Discard, res.Body)
+				require.NoError(t, err)
+				defer res.Body.Close()
+				require.Equal(t, http.StatusOK, res.StatusCode)
+				lastModified := res.Header.Get("Last-Modified")
+				require.Empty(t, lastModified)
+
+				// Make second request with If-Modified-Since far in past and expect normal response
+				req = mustNewRequest(t, http.MethodGet, url, nil)
+				req.Header.Add("Accept", responseFormat)
+				req.Header.Add("If-Modified-Since", "Mon, 13 Jun 2000 22:18:32 GMT")
+				res = mustDoWithoutRedirect(t, req)
+				_, err = io.Copy(io.Discard, res.Body)
+				require.NoError(t, err)
+				defer res.Body.Close()
+				require.Equal(t, http.StatusOK, res.StatusCode)
 			})
 		}
 
@@ -417,10 +471,192 @@ func TestHeaders(t *testing.T) {
 			testCORSPreflightRequest(t, "/", cid+".ipfs.subgw.example.com", "https://other.example.net", http.StatusOK)
 		})
 	})
+
+	t.Run("Content-Location is set when possible", func(t *testing.T) {
+		backend, root := newMockBackend(t, "fixtures.car")
+		backend.namesys["/ipns/dnslink-gateway.com"] = newMockNamesysItem(path.FromCid(root), 0)
+
+		ts := newTestServerWithConfig(t, backend, Config{
+			NoDNSLink: false,
+			PublicGateways: map[string]*PublicGateway{
+				"dnslink-gateway.com": {
+					Paths:                 []string{},
+					NoDNSLink:             false,
+					DeserializedResponses: true,
+				},
+				"subdomain-gateway.com": {
+					Paths:                 []string{"/ipfs", "/ipns"},
+					UseSubdomains:         true,
+					NoDNSLink:             true,
+					DeserializedResponses: true,
+				},
+			},
+			DeserializedResponses: true,
+		})
+
+		runTest := func(name, path, accept, host, expectedContentLocationHdr string) {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				req := mustNewRequest(t, http.MethodGet, ts.URL+path, nil)
+
+				if accept != "" {
+					req.Header.Set("Accept", accept)
+				}
+
+				if host != "" {
+					req.Host = host
+				}
+
+				resp := mustDoWithoutRedirect(t, req)
+				defer resp.Body.Close()
+
+				body, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+
+				require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+				require.Equal(t, expectedContentLocationHdr, resp.Header.Get("Content-Location"))
+			})
+		}
+
+		contentPath := path.FromCid(root).String() + "/empty-dir/"
+		subdomainGatewayHost := root.String() + ".ipfs.subdomain-gateway.com"
+		dnslinkGatewayHost := "dnslink-gateway.com"
+
+		runTest("Regular gateway with default format", contentPath, "", "", "")
+		runTest("Regular gateway with Accept: application/vnd.ipld.car;version=1;order=dfs;dups=n sets correct Content-Location", contentPath, "application/vnd.ipld.car;version=1;order=dfs;dups=n", "", contentPath+"?car-dups=n&car-order=dfs&car-version=1&format=car")
+		runTest("Regular gateway with ?dag-scope=entity&format=car", contentPath+"?dag-scope=entity&format=car", "", "", "")
+		runTest("Regular gateway preserves query parameters", contentPath+"?a=b&c=d", dagCborResponseFormat, "", contentPath+"?a=b&c=d&format=dag-cbor")
+		runTest("Subdomain gateway with default format", "/empty-dir/", "", subdomainGatewayHost, "")
+		runTest("DNSLink gateway with default format", "/empty-dir/", "", dnslinkGatewayHost, "")
+
+		for responseFormat, formatParam := range responseFormatToFormatParam {
+			if responseFormat == ipnsRecordResponseFormat {
+				continue
+			}
+
+			runTest("Regular gateway with Accept: "+responseFormat, contentPath, responseFormat, "", contentPath+"?format="+formatParam)
+			runTest("Regular gateway with ?format="+formatParam, contentPath+"?format="+formatParam, "", "", "")
+
+			runTest("Subdomain gateway with Accept: "+responseFormat, "/empty-dir/", responseFormat, subdomainGatewayHost, "/empty-dir/?format="+formatParam)
+			runTest("Subdomain gateway with ?format="+formatParam, "/empty-dir/?format="+formatParam, "", subdomainGatewayHost, "")
+
+			runTest("DNSLink gateway with Accept: "+responseFormat, "/empty-dir/", responseFormat, dnslinkGatewayHost, "/empty-dir/?format="+formatParam)
+			runTest("DNSLink gateway with ?format="+formatParam, "/empty-dir/?format="+formatParam, "", dnslinkGatewayHost, "")
+		}
+
+		runTest("Accept: application/vnd.ipld.car overrides ?format=raw in Content-Location", contentPath+"?format=raw", "application/vnd.ipld.car", "", contentPath+"?format=car")
+	})
+}
+
+// Testing a DAG with (optional) UnixFS1.5 modification time
+func TestHeadersUnixFSModeModTime(t *testing.T) {
+	t.Parallel()
+
+	ts, _, root := newTestServerAndNode(t, "unixfs-dir-with-mode-mtime.car")
+	var (
+		rootCID  = root.String() // "bafybeidbcy4u6y55gsemlubd64zk53xoxs73ifd6rieejxcr7xy46mjvky"
+		filePath = "/ipfs/" + rootCID + "/file1"
+		dirPath  = "/ipfs/" + rootCID + "/dir1/"
+	)
+
+	t.Run("If-Modified-Since matching UnixFS 1.5 modtime returns Not Modified", func(t *testing.T) {
+		test := func(responseFormat string, path string, entityType string, supported bool) {
+			t.Run(fmt.Sprintf("%s/%s support=%t", responseFormat, entityType, supported), func(t *testing.T) {
+				// Make regular request and read Last-Modified
+				url := ts.URL + path
+				req := mustNewRequest(t, http.MethodGet, url, nil)
+				req.Header.Add("Accept", responseFormat)
+				res := mustDoWithoutRedirect(t, req)
+				_, err := io.Copy(io.Discard, res.Body)
+				require.NoError(t, err)
+				defer res.Body.Close()
+				require.Equal(t, http.StatusOK, res.StatusCode)
+				lastModified := res.Header.Get("Last-Modified")
+				if supported {
+					assert.NotEmpty(t, lastModified)
+				} else {
+					assert.Empty(t, lastModified)
+					lastModified = "Mon, 13 Jun 2022 22:18:32 GMT" // manually set value for use in next steps
+				}
+
+				ifModifiedSinceTime, err := time.Parse(time.RFC1123, lastModified)
+				require.NoError(t, err)
+				oneHourBefore := ifModifiedSinceTime.Add(-1 * time.Hour).Truncate(time.Second)
+				oneHourAfter := ifModifiedSinceTime.Add(1 * time.Hour).Truncate(time.Second)
+				oneHourBeforeStr := oneHourBefore.Format(time.RFC1123)
+				oneHourAfterStr := oneHourAfter.Format(time.RFC1123)
+				lastModifiedStr := ifModifiedSinceTime.Format(time.RFC1123)
+
+				// Make second request with If-Modified-Since and value read from response to first request
+				req = mustNewRequest(t, http.MethodGet, url, nil)
+				req.Header.Add("Accept", responseFormat)
+				req.Header.Add("If-Modified-Since", lastModifiedStr)
+				res = mustDoWithoutRedirect(t, req)
+				_, err = io.Copy(io.Discard, res.Body)
+				require.NoError(t, err)
+				defer res.Body.Close()
+				if supported {
+					// 304 on exact match, can skip body
+					assert.Equal(t, http.StatusNotModified, res.StatusCode)
+				} else {
+					assert.Equal(t, http.StatusOK, res.StatusCode)
+				}
+
+				// Make third request with If-Modified-Since 1h before value read from response to first request
+				// and expect HTTP 200
+				req = mustNewRequest(t, http.MethodGet, url, nil)
+				req.Header.Add("Accept", responseFormat)
+				req.Header.Add("If-Modified-Since", oneHourBeforeStr)
+				res = mustDoWithoutRedirect(t, req)
+				_, err = io.Copy(io.Discard, res.Body)
+				require.NoError(t, err)
+				defer res.Body.Close()
+				// always return 200 with body because mtime from unixfs is after value from If-Modified-Since
+				// so it counts as an update
+				assert.Equal(t, http.StatusOK, res.StatusCode)
+
+				// Make third request with If-Modified-Since 1h after value read from response to first request
+				// and expect HTTP 200
+				req = mustNewRequest(t, http.MethodGet, url, nil)
+				req.Header.Add("Accept", responseFormat)
+				req.Header.Add("If-Modified-Since", oneHourAfterStr)
+				res = mustDoWithoutRedirect(t, req)
+				_, err = io.Copy(io.Discard, res.Body)
+				require.NoError(t, err)
+				defer res.Body.Close()
+				if supported {
+					// 304 because mtime from unixfs is before value from If-Modified-Since
+					// so no update, can skip body
+					assert.Equal(t, http.StatusNotModified, res.StatusCode)
+				} else {
+					assert.Equal(t, http.StatusOK, res.StatusCode)
+				}
+			})
+		}
+
+		file, dir := "file", "directory"
+		// supported on file-based web responses
+		test("", filePath, file, true)
+		test("text/html", filePath, file, true)
+
+		// not supported on other formats
+		// we may implement support for If-Modified-Since for below request types
+		// if users raise the need, but If-None-Match is way better
+		test(carResponseFormat, filePath, file, false)
+		test(rawResponseFormat, filePath, file, false)
+		test(tarResponseFormat, filePath, file, false)
+
+		test("", dirPath, dir, false)
+		test("text/html", dirPath, dir, false)
+		test(carResponseFormat, dirPath, dir, false)
+		test(rawResponseFormat, dirPath, dir, false)
+		test(tarResponseFormat, dirPath, dir, false)
+	})
 }
 
 func TestGoGetSupport(t *testing.T) {
-	ts, _, root := newTestServerAndNode(t, nil, "fixtures.car")
+	ts, _, root := newTestServerAndNode(t, "fixtures.car")
 
 	// mimic go-get
 	req := mustNewRequest(t, http.MethodGet, ts.URL+"/ipfs/"+root.String()+"?go-get=1", nil)
@@ -432,7 +668,7 @@ func TestRedirects(t *testing.T) {
 	t.Parallel()
 
 	t.Run("IPNS Base58 Multihash Redirect", func(t *testing.T) {
-		ts, _, _ := newTestServerAndNode(t, nil, "fixtures.car")
+		ts, _, _ := newTestServerAndNode(t, "fixtures.car")
 
 		t.Run("ED25519 Base58-encoded key", func(t *testing.T) {
 			t.Parallel()
@@ -453,7 +689,7 @@ func TestRedirects(t *testing.T) {
 
 	t.Run("URI Query Redirects", func(t *testing.T) {
 		t.Parallel()
-		ts, _, _ := newTestServerAndNode(t, mockNamesys{}, "fixtures.car")
+		ts, _, _ := newTestServerAndNode(t, "fixtures.car")
 
 		cid := "QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"
 		for _, test := range []struct {
@@ -464,13 +700,13 @@ func TestRedirects(t *testing.T) {
 			// - Browsers will send original URI in URL-escaped form
 			// - We expect query parameters to be persisted
 			// - We drop fragments, as those should not be sent by a browser
-			{"/ipfs/?uri=ipfs%3A%2F%2FQmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco%2Fwiki%2FFoo_%C4%85%C4%99.html%3Ffilename%3Dtest-%C4%99.html%23header-%C4%85", http.StatusMovedPermanently, "/ipfs/QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco/wiki/Foo_%c4%85%c4%99.html?filename=test-%c4%99.html"},
-			{"/ipfs/?uri=ipns%3A%2F%2Fexample.com%2Fwiki%2FFoo_%C4%85%C4%99.html%3Ffilename%3Dtest-%C4%99.html", http.StatusMovedPermanently, "/ipns/example.com/wiki/Foo_%c4%85%c4%99.html?filename=test-%c4%99.html"},
+			{"/ipfs/?uri=ipfs%3A%2F%2FQmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco%2Fwiki%2FFoo_%C4%85%C4%99.html%3Ffilename%3Dtest-%C4%99.html%23header-%C4%85", http.StatusMovedPermanently, "/ipfs/QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco/wiki/Foo_%C4%85%C4%99.html?filename=test-%C4%99.html"},
+			{"/ipfs/?uri=ipns%3A%2F%2Fexample.com%2Fwiki%2FFoo_%C4%85%C4%99.html%3Ffilename%3Dtest-%C4%99.html", http.StatusMovedPermanently, "/ipns/example.com/wiki/Foo_%C4%85%C4%99.html?filename=test-%C4%99.html"},
 			{"/ipfs/?uri=ipfs://" + cid, http.StatusMovedPermanently, "/ipfs/" + cid},
 			{"/ipfs?uri=ipfs://" + cid, http.StatusMovedPermanently, "/ipfs/" + cid},
 			{"/ipfs/?uri=ipns://" + cid, http.StatusMovedPermanently, "/ipns/" + cid},
-			{"/ipns/?uri=ipfs%3A%2F%2FQmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco%2Fwiki%2FFoo_%C4%85%C4%99.html%3Ffilename%3Dtest-%C4%99.html%23header-%C4%85", http.StatusMovedPermanently, "/ipfs/QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco/wiki/Foo_%c4%85%c4%99.html?filename=test-%c4%99.html"},
-			{"/ipns/?uri=ipns%3A%2F%2Fexample.com%2Fwiki%2FFoo_%C4%85%C4%99.html%3Ffilename%3Dtest-%C4%99.html", http.StatusMovedPermanently, "/ipns/example.com/wiki/Foo_%c4%85%c4%99.html?filename=test-%c4%99.html"},
+			{"/ipns/?uri=ipfs%3A%2F%2FQmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco%2Fwiki%2FFoo_%C4%85%C4%99.html%3Ffilename%3Dtest-%C4%99.html%23header-%C4%85", http.StatusMovedPermanently, "/ipfs/QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco/wiki/Foo_%C4%85%C4%99.html?filename=test-%C4%99.html"},
+			{"/ipns/?uri=ipns%3A%2F%2Fexample.com%2Fwiki%2FFoo_%C4%85%C4%99.html%3Ffilename%3Dtest-%C4%99.html", http.StatusMovedPermanently, "/ipns/example.com/wiki/Foo_%C4%85%C4%99.html?filename=test-%C4%99.html"},
 			{"/ipns?uri=ipns://" + cid, http.StatusMovedPermanently, "/ipns/" + cid},
 			{"/ipns/?uri=ipns://" + cid, http.StatusMovedPermanently, "/ipns/" + cid},
 			{"/ipns/?uri=ipfs://" + cid, http.StatusMovedPermanently, "/ipfs/" + cid},
@@ -492,7 +728,7 @@ func TestRedirects(t *testing.T) {
 	t.Run("IPNS Hostname Redirects", func(t *testing.T) {
 		t.Parallel()
 
-		ts, backend, root := newTestServerAndNode(t, nil, "ipns-hostname-redirects.car")
+		ts, backend, root := newTestServerAndNode(t, "ipns-hostname-redirects.car")
 		backend.namesys["/ipns/example.net"] = newMockNamesysItem(path.FromCid(root), 0)
 
 		// make request to directory containing index.html
@@ -555,9 +791,11 @@ func TestRedirects(t *testing.T) {
 
 			// Check statuses and body.
 			require.Equal(t, http.StatusOK, res.StatusCode)
-			body, err := io.ReadAll(res.Body)
-			require.NoError(t, err)
-			require.Equal(t, "hello world\n", string(body))
+			if method != http.MethodHead {
+				body, err := io.ReadAll(res.Body)
+				require.NoError(t, err)
+				require.Equal(t, "hello world\n", string(body))
+			}
 
 			// Check Etag.
 			etag := res.Header.Get("Etag")
@@ -576,6 +814,92 @@ func TestRedirects(t *testing.T) {
 
 		do(http.MethodGet)
 		do(http.MethodHead)
+	})
+
+	t.Run("Superfluous namespace", func(t *testing.T) {
+		t.Parallel()
+
+		backend, root := newMockBackend(t, "fixtures.car")
+		backend.namesys["/ipns/dnslink-gateway.com"] = newMockNamesysItem(path.FromCid(root), 0)
+		backend.namesys["/ipns/dnslink-website.com"] = newMockNamesysItem(path.FromCid(root), 0)
+
+		ts := newTestServerWithConfig(t, backend, Config{
+			NoDNSLink: false,
+			PublicGateways: map[string]*PublicGateway{
+				"dnslink-gateway.com": {
+					Paths:                 []string{"/ipfs", "/ipns"},
+					NoDNSLink:             false,
+					DeserializedResponses: true,
+				},
+				"dnslink-website.com": {
+					Paths:                 []string{},
+					NoDNSLink:             false,
+					DeserializedResponses: true,
+				},
+				"gateway.com": {
+					Paths:                 []string{"/ipfs"},
+					UseSubdomains:         false,
+					NoDNSLink:             true,
+					DeserializedResponses: true,
+				},
+				"subdomain-gateway.com": {
+					Paths:                 []string{"/ipfs", "/ipns"},
+					UseSubdomains:         true,
+					NoDNSLink:             true,
+					DeserializedResponses: true,
+				},
+			},
+			DeserializedResponses: true,
+		})
+
+		for _, test := range []struct {
+			host     string
+			path     string
+			status   int
+			location string
+		}{
+			// Barebones gateway
+			{"", "/ipfs/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusMovedPermanently, "/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"},
+			{"", "/ipfs/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusMovedPermanently, "/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"},
+			{"", "/ipfs/ipns/dnslink.com", http.StatusMovedPermanently, "/ipns/dnslink.com"},
+
+			// DNSLink Gateway with /ipfs and /ipns enabled
+			{"dnslink-gateway.com", "/ipfs/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusMovedPermanently, "/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"},
+			{"dnslink-gateway.com", "/ipfs/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusMovedPermanently, "/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"},
+			{"dnslink-gateway.com", "/ipfs/ipns/dnslink.com", http.StatusMovedPermanently, "/ipns/dnslink.com"},
+
+			// DNSLink Gateway without /ipfs and /ipns
+			{"dnslink-website.com", "/ipfs/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusNotFound, ""},
+			{"dnslink-website.com", "/ipfs/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusNotFound, ""},
+			{"dnslink-website.com", "/ipfs/ipns/dnslink.com", http.StatusNotFound, ""},
+
+			// Public gateway
+			{"gateway.com", "/ipfs/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusMovedPermanently, "/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"},
+			{"gateway.com", "/ipfs/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusMovedPermanently, "/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"},
+			{"gateway.com", "/ipfs/ipns/dnslink.com", http.StatusMovedPermanently, "/ipns/dnslink.com"},
+
+			// Subdomain gateway
+			{"subdomain-gateway.com", "/ipfs/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusMovedPermanently, "/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"},
+			{"subdomain-gateway.com", "/ipfs/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", http.StatusMovedPermanently, "/ipns/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR"},
+			{"subdomain-gateway.com", "/ipfs/ipns/dnslink.com", http.StatusMovedPermanently, "/ipns/dnslink.com"},
+		} {
+			testName := ts.URL + test.path
+			if test.host != "" {
+				testName += " " + test.host
+			}
+
+			t.Run(testName, func(t *testing.T) {
+				req := mustNewRequest(t, http.MethodGet, ts.URL+test.path, nil)
+				req.Header.Set("Accept", "text/html")
+				if test.host != "" {
+					req.Host = test.host
+				}
+				resp := mustDoWithoutRedirect(t, req)
+				defer resp.Body.Close()
+				require.Equal(t, test.status, resp.StatusCode)
+				require.Equal(t, test.location, resp.Header.Get("Location"))
+			})
+		}
 	})
 }
 
@@ -760,7 +1084,7 @@ func TestErrorBubblingFromBackend(t *testing.T) {
 		})
 	}
 
-	testError("500 Not Found from IPLD", &ipld.ErrNotFound{}, http.StatusInternalServerError)
+	testError("404 Not Found from IPLD", &ipld.ErrNotFound{}, http.StatusNotFound)
 	testError("404 Not Found from path resolver", &resolver.ErrNoLink{}, http.StatusNotFound)
 	testError("502 Bad Gateway", ErrBadGateway, http.StatusBadGateway)
 	testError("504 Gateway Timeout", ErrGatewayTimeout, http.StatusGatewayTimeout)
@@ -862,7 +1186,7 @@ func TestPanicStatusCode(t *testing.T) {
 
 func TestBrowserErrorHTML(t *testing.T) {
 	t.Parallel()
-	ts, _, root := newTestServerAndNode(t, nil, "fixtures.car")
+	ts, _, root := newTestServerAndNode(t, "fixtures.car")
 
 	t.Run("plain error if request does not have Accept: text/html", func(t *testing.T) {
 		t.Parallel()

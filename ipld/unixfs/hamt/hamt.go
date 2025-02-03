@@ -29,16 +29,18 @@ import (
 	"os"
 	"sync"
 
-	"golang.org/x/sync/errgroup"
-
+	"github.com/gammazero/deque"
+	dag "github.com/ipfs/boxo/ipld/merkledag"
 	format "github.com/ipfs/boxo/ipld/unixfs"
 	"github.com/ipfs/boxo/ipld/unixfs/internal"
-
-	dag "github.com/ipfs/boxo/ipld/merkledag"
 	bitfield "github.com/ipfs/go-bitfield"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
+	logging "github.com/ipfs/go-log/v2"
+	"golang.org/x/sync/errgroup"
 )
+
+var log = logging.Logger("unixfs-hamt")
 
 const (
 	// HashMurmur3 is the multiformats identifier for Murmur3
@@ -430,8 +432,13 @@ type listCidsAndShards struct {
 func (ds *Shard) walkChildren(processLinkValues func(formattedLink *ipld.Link) error) (*listCidsAndShards, error) {
 	res := &listCidsAndShards{}
 
-	for idx, lnk := range ds.childer.links {
-		if nextShard := ds.childer.children[idx]; nextShard == nil {
+	for i, nextShard := range ds.childer.children {
+		if nextShard == nil {
+			lnk := ds.childer.link(i)
+			if lnk == nil {
+				log.Warnf("internal HAMT error: both link and shard nil at pos %d, dumping shard: %+v", i, *ds)
+				return nil, fmt.Errorf("internal HAMT error: both link and shard nil, check log")
+			}
 			lnkLinkType, err := ds.childLinkType(lnk)
 			if err != nil {
 				return nil, err
@@ -454,7 +461,6 @@ func (ds *Shard) walkChildren(processLinkValues func(formattedLink *ipld.Link) e
 			default:
 				return nil, errors.New("unsupported shard link type")
 			}
-
 		} else {
 			if nextShard.val != nil {
 				formattedLink := &ipld.Link{
@@ -557,7 +563,7 @@ func parallelShardWalk(ctx context.Context, root *Shard, dserv ipld.DAGService, 
 	}
 
 	send := feed
-	var todoQueue []*listCidsAndShards
+	var todoQueue deque.Deque[*listCidsAndShards]
 	var inProgress int
 
 	next := &listCidsAndShards{
@@ -569,9 +575,8 @@ dispatcherLoop:
 		select {
 		case send <- next:
 			inProgress++
-			if len(todoQueue) > 0 {
-				next = todoQueue[0]
-				todoQueue = todoQueue[1:]
+			if todoQueue.Len() > 0 {
+				next = todoQueue.PopFront()
 			} else {
 				next = nil
 				send = nil
@@ -586,7 +591,7 @@ dispatcherLoop:
 				next = nextNodes
 				send = feed
 			} else {
-				todoQueue = append(todoQueue, nextNodes)
+				todoQueue.PushBack(nextNodes)
 			}
 		case <-errGrpCtx.Done():
 			break dispatcherLoop

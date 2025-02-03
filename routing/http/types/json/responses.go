@@ -11,9 +11,17 @@ type ProvidersResponse struct {
 	Providers RecordsArray
 }
 
+func (r ProvidersResponse) Length() int {
+	return len(r.Providers)
+}
+
 // PeersResponse is the result of a GET Peers request.
 type PeersResponse struct {
 	Peers []*types.PeerRecord
+}
+
+func (r PeersResponse) Length() int {
+	return len(r.Peers)
 }
 
 // RecordsArray is an array of [types.Record]
@@ -41,8 +49,10 @@ func (r *RecordsArray) UnmarshalJSON(b []byte) error {
 				return err
 			}
 			*r = append(*r, &prov)
+		//nolint:staticcheck
 		//lint:ignore SA1019 // ignore staticcheck
 		case types.SchemaBitswap:
+			//nolint:staticcheck
 			//lint:ignore SA1019 // ignore staticcheck
 			var prov types.BitswapRecord
 			err := json.Unmarshal(provBytes, &prov)
@@ -65,6 +75,10 @@ type WriteProvidersResponse struct {
 	ProvideResults []types.Record
 }
 
+func (r WriteProvidersResponse) Length() int {
+	return len(r.ProvideResults)
+}
+
 func (r *WriteProvidersResponse) UnmarshalJSON(b []byte) error {
 	var tempWPR struct{ ProvideResults []json.RawMessage }
 	err := json.Unmarshal(b, &tempWPR)
@@ -80,8 +94,10 @@ func (r *WriteProvidersResponse) UnmarshalJSON(b []byte) error {
 		}
 
 		switch rawProv.Schema {
+		//nolint:staticcheck
 		//lint:ignore SA1019 // ignore staticcheck
 		case types.SchemaBitswap:
+			//nolint:staticcheck
 			//lint:ignore SA1019 // ignore staticcheck
 			var prov types.WriteBitswapRecordResponse
 			err := json.Unmarshal(rawProv.Bytes, &prov)

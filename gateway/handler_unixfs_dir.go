@@ -47,11 +47,17 @@ func (i *handler) serveDirectory(ctx context.Context, w http.ResponseWriter, r *
 			suffix := "/"
 			// preserve query parameters
 			if r.URL.RawQuery != "" {
-				suffix = suffix + "?" + r.URL.RawQuery
+				suffix = suffix + "?" + url.PathEscape(r.URL.RawQuery)
+			}
+			// Re-escape path instead of reusing RawPath to avod mix of lawer
+			// and upper hex that may come from RawPath.
+			if strings.ContainsRune(requestURI.RawPath, '%') {
+				requestURI.RawPath = ""
 			}
 			// /ipfs/cid/foo?bar must be redirected to /ipfs/cid/foo/?bar
-			redirectURL := originalURLPath + suffix
+			redirectURL := requestURI.EscapedPath() + suffix
 			rq.logger.Debugw("directory location moved permanently", "status", http.StatusMovedPermanently)
+
 			http.Redirect(w, r, redirectURL, http.StatusMovedPermanently)
 			return true
 		}
@@ -121,11 +127,9 @@ func (i *handler) serveDirectory(ctx context.Context, w http.ResponseWriter, r *
 			i.unixfsDirIndexGetMetric.WithLabelValues(originalContentPath.Namespace()).Observe(time.Since(rq.begin).Seconds())
 		}
 		return success
-	}
-
-	if isErrNotFound(err) {
+	} else if isErrNotFound(err) {
 		rq.logger.Debugw("no index.html; noop", "path", idxPath)
-	} else if err != nil {
+	} else {
 		i.webError(w, r, err, http.StatusInternalServerError)
 		return false
 	}
@@ -138,9 +142,14 @@ func (i *handler) serveDirectory(ctx context.Context, w http.ResponseWriter, r *
 	dirEtag := getDirListingEtag(resolvedPath.RootCid())
 	w.Header().Set("Etag", dirEtag)
 
-	// Add TTL if known.
+	// Set Cache-Control
 	if rq.ttl > 0 {
-		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(rq.ttl.Seconds())))
+		// Use known TTL from IPNS Record or DNSLink TXT Record
+		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, stale-while-revalidate=2678400", int(rq.ttl.Seconds())))
+	} else if !rq.contentPath.Mutable() {
+		// Cache for 1 week, serve stale cache for up to a month
+		// (style of generated HTML may change, should not be cached forever)
+		w.Header().Set("Cache-Control", "public, max-age=604800, stale-while-revalidate=2678400")
 	}
 
 	if r.Method == http.MethodHead {

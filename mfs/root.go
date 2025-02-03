@@ -7,11 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	ft "github.com/ipfs/boxo/ipld/unixfs"
-
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
 )
@@ -63,6 +63,11 @@ const (
 	TDir
 )
 
+const (
+	repubQuick = 300 * time.Millisecond
+	repubLong  = 3 * time.Second
+)
+
 // FSNode abstracts the `Directory` and `File` structures, it represents
 // any child node in the MFS (i.e., all the nodes besides the `Root`). It
 // is the counterpart of the `parent` interface which represents any
@@ -73,6 +78,8 @@ type FSNode interface {
 
 	Flush() error
 	Type() NodeType
+	SetModTime(ts time.Time) error
+	SetMode(mode os.FileMode) error
 }
 
 // IsDir checks whether the FSNode is dir type
@@ -97,12 +104,7 @@ type Root struct {
 func NewRoot(parent context.Context, ds ipld.DAGService, node *dag.ProtoNode, pf PubFunc) (*Root, error) {
 	var repub *Republisher
 	if pf != nil {
-		repub = NewRepublisher(parent, pf, time.Millisecond*300, time.Second*3)
-
-		// No need to take the lock here since we just created
-		// the `Republisher` and no one has access to it yet.
-
-		go repub.Run(node.Cid())
+		repub = NewRepublisher(pf, repubQuick, repubLong, node.Cid())
 	}
 
 	root := &Root{
@@ -167,19 +169,7 @@ func (kr *Root) Flush() error {
 func (kr *Root) FlushMemFree(ctx context.Context) error {
 	dir := kr.GetDirectory()
 
-	if err := dir.Flush(); err != nil {
-		return err
-	}
-
-	dir.lock.Lock()
-	defer dir.lock.Unlock()
-
-	for name := range dir.entriesCache {
-		delete(dir.entriesCache, name)
-	}
-	// TODO: Can't we just create new maps?
-
-	return nil
+	return dir.Flush()
 }
 
 // updateChildEntry implements the `parent` interface, and signals

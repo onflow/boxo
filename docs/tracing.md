@@ -9,7 +9,7 @@ for the `OTEL_TRACES_EXPORTER` environment variables. Therefore, we provide some
 helper functions under [`boxo/tracing`](../tracing/) to support these.
 
 In this document, we document the quirks of our custom support for the `OTEL_TRACES_EXPORTER`,
-as well as examples on how to use tracing, create traceable headers, and how
+as well as examples of how to use tracing, create traceable headers, and how
 to use the Jaeger UI. The [Gateway examples](../examples/gateway/) fully support Tracing.
 
 - [Environment Variables](#environment-variables)
@@ -54,7 +54,7 @@ Default: `"grpc"`
 
 ### `Zipkin Exporter`
 
-See [Zipkin Exporter](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/sdk-environment-variables.md#zipkin-exporter).
+See [Zipkin Exporter](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/configuration/sdk-environment-variables.md#zipkin-exporter).
 
 ### `File Exporter`
 
@@ -66,7 +66,7 @@ Default: `"$PWD/traces.json"`
 
 ### `OTEL_PROPAGATORS`
 
-See [General SDK Configuration](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/sdk-environment-variables.md#general-sdk-configuration).
+See [General SDK Configuration](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/configuration/sdk-environment-variables.md#general-sdk-configuration).
 
 ## Using Jaeger UI
 
@@ -134,6 +134,6 @@ the complete trace of this request.
 [Open Telemetry]: https://opentelemetry.io/
 [opentelemetry-go]: https://github.com/open-telemetry/opentelemetry-go
 [Trace Context]: https://www.w3.org/TR/trace-context
-[OpenTelemetry Environment Variable Specification]: https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/sdk-environment-variables.md
+[OpenTelemetry Environment Variable Specification]: https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/configuration/sdk-environment-variables.md
 [OpenTelemetry Protocol Exporter]: https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/protocol/exporter.md
 [Jaeger UI]: https://github.com/jaegertracing/jaeger-ui

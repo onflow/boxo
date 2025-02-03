@@ -26,7 +26,8 @@ Once you have your example finished, do not forget to run `go mod tidy` and addi
 
 ## Examples and Tutorials
 
-- [Fetching a UnixFS file by CID](./unixfs-file-cid)
-- [Gateway backed by a CAR file](./gateway/car)
-- [Gateway backed by a remote blockstore and IPNS resolver](./gateway/proxy)
+- [Transferring UnixFS file data with Bitswap](./bitswap-transfer)
+- [Gateway backed by a local blockstore in form of a CAR file](./gateway/car-file)
+- [Gateway backed by a remote (HTTP) blockstore and IPNS resolver](./gateway/proxy-blocks)
+- [Gateway backed by a remote (HTTP) CAR Gateway](./gateway/proxy-car)
 - [Delegated Routing V1 Command Line Client](./routing/delegated-routing-client/)

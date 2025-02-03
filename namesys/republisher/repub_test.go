@@ -6,23 +6,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jbenet/goprocess"
-	"github.com/libp2p/go-libp2p"
-	dht "github.com/libp2p/go-libp2p-kad-dht"
-	ic "github.com/libp2p/go-libp2p/core/crypto"
-	host "github.com/libp2p/go-libp2p/core/host"
-	peer "github.com/libp2p/go-libp2p/core/peer"
-	routing "github.com/libp2p/go-libp2p/core/routing"
-	"github.com/stretchr/testify/require"
-
 	"github.com/ipfs/boxo/ipns"
+	"github.com/ipfs/boxo/keystore"
+	"github.com/ipfs/boxo/namesys"
+	. "github.com/ipfs/boxo/namesys/republisher"
 	"github.com/ipfs/boxo/path"
 	ds "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
-
-	keystore "github.com/ipfs/boxo/keystore"
-	"github.com/ipfs/boxo/namesys"
-	. "github.com/ipfs/boxo/namesys/republisher"
+	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	ic "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/routing"
+	"github.com/stretchr/testify/require"
 )
 
 type mockNode struct {
@@ -40,7 +37,7 @@ func getMockNode(t *testing.T, ctx context.Context) *mockNode {
 	dstore := dssync.MutexWrap(ds.NewMapDatastore())
 	var idht *dht.IpfsDHT
 	h, err := libp2p.New(
-		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
+		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			rt, err := dht.New(ctx, h, dht.Mode(dht.ModeServer))
 			idht = rt
@@ -125,8 +122,8 @@ func TestRepublish(t *testing.T) {
 	repub.Interval = time.Second
 	repub.RecordLifetime = time.Second * 5
 
-	proc := goprocess.Go(repub.Run)
-	defer proc.Close()
+	stop := repub.Run()
+	defer stop()
 
 	// now wait a couple seconds for it to fire
 	time.Sleep(time.Second * 2)
@@ -182,8 +179,8 @@ func TestLongEOLRepublish(t *testing.T) {
 	repub.Interval = time.Millisecond * 500
 	repub.RecordLifetime = time.Second
 
-	proc := goprocess.Go(repub.Run)
-	defer proc.Close()
+	stop := repub.Run()
+	defer stop()
 
 	// now wait a couple seconds for it to fire a few times
 	time.Sleep(time.Second * 2)

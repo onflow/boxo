@@ -37,11 +37,13 @@ type contentRouter struct {
 	maxProvideBatchSize   int
 }
 
-var _ routing.ContentRouting = (*contentRouter)(nil)
-var _ routing.PeerRouting = (*contentRouter)(nil)
-var _ routing.ValueStore = (*contentRouter)(nil)
-var _ routinghelpers.ProvideManyRouter = (*contentRouter)(nil)
-var _ routinghelpers.ReadyAbleRouter = (*contentRouter)(nil)
+var (
+	_ routing.ContentRouting           = (*contentRouter)(nil)
+	_ routing.PeerRouting              = (*contentRouter)(nil)
+	_ routing.ValueStore               = (*contentRouter)(nil)
+	_ routinghelpers.ProvideManyRouter = (*contentRouter)(nil)
+	_ routinghelpers.ReadyAbleRouter   = (*contentRouter)(nil)
+)
 
 type option func(c *contentRouter)
 
@@ -113,13 +115,13 @@ func (c *contentRouter) Ready() bool {
 
 // readProviderResponses reads peer records (and bitswap records for legacy
 // compatibility) from the iterator into the given channel.
-func readProviderResponses(iter iter.ResultIter[types.Record], ch chan<- peer.AddrInfo) {
+func readProviderResponses(ctx context.Context, iter iter.ResultIter[types.Record], ch chan<- peer.AddrInfo) {
 	defer close(ch)
 	defer iter.Close()
 	for iter.Next() {
 		res := iter.Val()
 		if res.Err != nil {
-			logger.Warnw("error iterating provider responses: %s", res.Err)
+			logger.Warnf("error iterating provider responses: %s", res.Err)
 			continue
 		}
 		v := res.Val
@@ -140,10 +142,16 @@ func readProviderResponses(iter iter.ResultIter[types.Record], ch chan<- peer.Ad
 				addrs = append(addrs, a.Multiaddr)
 			}
 
-			ch <- peer.AddrInfo{
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- peer.AddrInfo{
 				ID:    *result.ID,
 				Addrs: addrs,
+			}:
 			}
+
+		//nolint:staticcheck
 		//lint:ignore SA1019 // ignore staticcheck
 		case types.SchemaBitswap:
 			//lint:ignore SA1019 // ignore staticcheck
@@ -162,9 +170,13 @@ func readProviderResponses(iter iter.ResultIter[types.Record], ch chan<- peer.Ad
 				addrs = append(addrs, a.Multiaddr)
 			}
 
-			ch <- peer.AddrInfo{
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- peer.AddrInfo{
 				ID:    *result.ID,
 				Addrs: addrs,
+			}:
 			}
 		}
 	}
@@ -179,7 +191,7 @@ func (c *contentRouter) FindProvidersAsync(ctx context.Context, key cid.Cid, num
 		return ch
 	}
 	ch := make(chan peer.AddrInfo)
-	go readProviderResponses(resultsIter, ch)
+	go readProviderResponses(ctx, resultsIter, ch)
 	return ch
 }
 
@@ -193,21 +205,32 @@ func (c *contentRouter) FindPeer(ctx context.Context, pid peer.ID) (peer.AddrInf
 	for iter.Next() {
 		res := iter.Val()
 		if res.Err != nil {
-			logger.Warnw("error iterating provider responses: %s", res.Err)
+			logger.Warnf("error iterating peer responses: %s", res.Err)
 			continue
 		}
+
+		if *res.Val.ID != pid {
+			logger.Warnf("searched for peerID %s, got response for %s:", pid, *res.Val.ID)
+			continue
+		}
+
 		var addrs []multiaddr.Multiaddr
 		for _, a := range res.Val.Addrs {
 			addrs = append(addrs, a.Multiaddr)
 		}
 
+		// If there are no addresses there's nothing of value to return
+		if len(addrs) == 0 {
+			continue
+		}
+
 		return peer.AddrInfo{
-			ID:    *res.Val.ID,
+			ID:    pid,
 			Addrs: addrs,
 		}, nil
 	}
 
-	return peer.AddrInfo{}, err
+	return peer.AddrInfo{}, routing.ErrNotFound
 }
 
 func (c *contentRouter) PutValue(ctx context.Context, key string, data []byte, opts ...routing.Option) error {

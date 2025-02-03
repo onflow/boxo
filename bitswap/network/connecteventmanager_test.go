@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ipfs/boxo/bitswap/internal/testutil"
+	"github.com/ipfs/go-test/random"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/require"
 )
@@ -40,13 +40,13 @@ func wait(t *testing.T, c *connectEventManager) {
 	require.Eventually(t, func() bool {
 		c.lk.RLock()
 		defer c.lk.RUnlock()
-		return len(c.changeQueue) == 0
+		return c.changeQueue.Len() == 0
 	}, time.Second, time.Millisecond, "connection event manager never processed events")
 }
 
 func TestConnectEventManagerConnectDisconnect(t *testing.T) {
 	connListener := newMockConnListener()
-	peers := testutil.GeneratePeers(2)
+	peers := random.Peers(2)
 	cem := newConnectEventManager(connListener)
 	cem.Start()
 	t.Cleanup(cem.Stop)
@@ -85,7 +85,7 @@ func TestConnectEventManagerConnectDisconnect(t *testing.T) {
 
 func TestConnectEventManagerMarkUnresponsive(t *testing.T) {
 	connListener := newMockConnListener()
-	p := testutil.GeneratePeers(1)[0]
+	p := random.Peers(1)[0]
 	cem := newConnectEventManager(connListener)
 	cem.Start()
 	t.Cleanup(cem.Stop)
@@ -134,7 +134,7 @@ func TestConnectEventManagerMarkUnresponsive(t *testing.T) {
 
 func TestConnectEventManagerDisconnectAfterMarkUnresponsive(t *testing.T) {
 	connListener := newMockConnListener()
-	p := testutil.GeneratePeers(1)[0]
+	p := random.Peers(1)[0]
 	cem := newConnectEventManager(connListener)
 	cem.Start()
 	t.Cleanup(cem.Stop)
