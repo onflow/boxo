@@ -208,7 +208,10 @@ func newMessageFromProto(pbm pb.Message) (BitSwapMessage, error) {
 	// deprecated
 	for _, d := range pbm.Blocks {
 		// CIDv0, sha256, protobuf only
-		b := blocks.NewBlock(d)
+		data := make([]byte, len(d))
+		copy(data, d)
+
+		b := blocks.NewBlock(data)
 		m.AddBlock(b)
 	}
 	//
@@ -219,12 +222,15 @@ func newMessageFromProto(pbm pb.Message) (BitSwapMessage, error) {
 			return nil, err
 		}
 
-		c, err := pref.Sum(b.GetData())
+		data := make([]byte, len(b.GetData()))
+		copy(data, b.GetData())
+
+		c, err := pref.Sum(data)
 		if err != nil {
 			return nil, err
 		}
 
-		blk, err := blocks.NewBlockWithCid(b.GetData(), c)
+		blk, err := blocks.NewBlockWithCid(data, c)
 		if err != nil {
 			return nil, err
 		}
